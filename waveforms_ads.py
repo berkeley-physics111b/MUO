@@ -157,6 +157,9 @@ def _load_dwf() -> ctypes.CDLL:
 class DWFError(Exception):
     """Raised when a DWF API call fails."""
 
+class TriggerWithoutChannelError(Exception):
+    """Raised when a trigger has been set with no channel to trigger on."""
+
 
 # ---------------------------------------------------------------------------
 # Main class
@@ -417,6 +420,15 @@ class WaveFormsADS:
             "FDwfAnalogInChannelOffsetSet",
         )
 
+    def analog_in_set_attenuation(self, channel: int, attenuation: float) -> None:
+        """Set the channel attenuation as a unitless scaling factor."""
+        self._check(
+            self._dwf.FDwfAnalogInChannelAttenuationSet(
+                self._hdwf, channel, ctypes.c_double(attenuation)
+            ),
+            "FDwfAnalogInChannelAttenuationSet",
+        )
+
     def analog_in_set_coupling(self, channel: int, coupling: int = DwfAnalogCouplingDC) -> None:
         """Set channel coupling: DwfAnalogCouplingDC (0) or DwfAnalogCouplingAC (1)."""
         self._check(
@@ -625,19 +637,78 @@ class WaveFormsADS:
         """More generalized version of analog in capture for easy settings for multiple channels.
 
         Args:
-            channel_settings (dict): _description_
-            sample_rate_hz (float, optional): _description_. Defaults to 1e6.
-            buffer_size (int, optional): _description_. Defaults to 4096.
-            trigger_level_v (Optional[float], optional): _description_. Defaults to None.
-            trigger_channel (Optional[int], optional): _description_. Defaults to None.
-            trigger_condition (int, optional): _description_. Defaults to DwfTriggerSlopeRise.
-            auto_timeout_s (float, optional): _description_. Defaults to 1.0.
-            timeout_s (float, optional): _description_. Defaults to 5.0.
+            channel_settings (dict): 
+                Dictionary where keys are channel numbers (0 indexed) and values are 
+                dictionaries of parameters (y_range, y_offset, attenuation).
+            sample_rate_hz : float
+                ADC sample rate in Hz.
+            buffer_size : int
+                Number of samples to capture.
+            trigger_level_v : float or None
+                Trigger voltage level.  If None, no hardware trigger is set
+                (free-run / auto-trigger only).
+            trigger_channel : int or None
+                Channel to trigger on.  Defaults to *channel*.
+            trigger_condition : int
+                DwfTriggerSlopeRise / DwfTriggerSlopeFall / DwfTriggerSlopeEither.
+            auto_timeout_s : float
+                Auto-trigger timeout (seconds).  Use 0 for strict "Normal" trigger.
+            timeout_s : float
+                Host-side acquisition timeout before raising TimeoutError.
 
         Returns:
-            dict: _description_
+            dict:
+                Dictionary where keys are channel numbers (0 indexed) and values are
+                np.ndarray of ``buffer_size`` voltage samples (float64, volts)
         """
-        ...
+        if trigger_level_v is not None and trigger_channel is None:
+            raise TriggerWithoutChannelError
+
+        self.analog_in_reset()
+        self.analog_in_set_sample_rate(sample_rate_hz)
+        self.analog_in_set_buffer_size(buffer_size)
+        self.analog_in_set_acquisition_mode(acqmodeSingle)
+
+        channels = channel_settings.keys()
+
+        for channel in channels:
+            self.analog_in_channel_enable(channel)
+            y_offset, y_range, attenuation = channels[channel]["y_offset"], channels[channel]["y_range"], channels[channel]["attenuation"]
+            self.analog_in_set_offset(channel, y_offset)
+            self.analog_in_set_range(channel, y_range)
+            self.analog_in_set_attenuation(channel, attenuation)
+
+        if trigger_level_v is not None:
+            self.analog_in_set_trigger_source(trigsrcDetectorAnalogIn)
+            self.analog_in_set_trigger_channel(trigger_channel)
+            self.analog_in_set_trigger_type(trigtypeEdge)
+            self.analog_in_set_trigger_level(trigger_level_v)
+            self.analog_in_set_trigger_condition(trigger_condition)
+            self.analog_in_set_trigger_auto_timeout(auto_timeout_s)
+        else:
+            self.analog_in_set_trigger_source(trigsrcNone)
+
+        self.analog_in_configure(reconfigure=True, start=True)
+
+        deadline = time.time() + timeout_s
+        while True:
+            state = self.analog_in_status(read_data=True)
+            if state == DwfStateDone:
+                break
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f"analog_in_capture: acquisition did not complete within "
+                    f"{timeout_s:.1f} s (last state = {self._state_name(state)})"
+                )
+            time.sleep(0.001)
+        
+        results = {}
+        for channel in channels:
+            results[channel] = self.analog_in_get_data(channel, buffer_size)
+
+        return results
+
+
 
     def analog_in_record(
         self,

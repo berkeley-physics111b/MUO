@@ -556,6 +556,9 @@ class WaveFormsADS:
         channel: int = 0,
         sample_rate_hz: float = 1e6,
         buffer_size: int = 4096,
+        y_offset: float = 0.0,
+        y_range: float = 5.0,
+        attenuation: float = 1.0,
         trigger_level_v: Optional[float] = None,
         trigger_channel: Optional[int] = None,
         trigger_condition: int = DwfTriggerSlopeRise,
@@ -573,6 +576,12 @@ class WaveFormsADS:
             ADC sample rate in Hz.
         buffer_size : int
             Number of samples to capture.
+        y_offset : float
+            Offset to channel (V).
+        y_range : float
+            Pk to pk voltage range (also defines channel resolution) (V).
+        attenuation : float
+            Attenuation of channel (effectively multiplier) (unitless).
         trigger_level_v : float or None
             Trigger voltage level.  If None, no hardware trigger is set
             (free-run / auto-trigger only).
@@ -594,6 +603,9 @@ class WaveFormsADS:
         self.analog_in_set_sample_rate(sample_rate_hz)
         self.analog_in_set_buffer_size(buffer_size)
         self.analog_in_set_acquisition_mode(acqmodeSingle)
+        self.analog_in_set_offset(channel, y_offset)
+        self.analog_in_set_range(channel, y_range)
+        self.analog_in_set_attenuation(channel, attenuation)
         self.analog_in_channel_enable(channel)
 
         if trigger_level_v is not None:

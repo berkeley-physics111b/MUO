@@ -1,17 +1,17 @@
 """
-muo_gui.py
+muon_detector.py
 ==========
 Two-tab Tkinter GUI for muon detector data acquisition using the
 Digilent WaveForms ADS hardware (waveforms_ads.py).
 
-Tab 1 – Signal Viewer   (based on muo_view_signals.py)
-Tab 2 – Live Histogram  (based on muo_histogram.py)
+Tab 1 - Signal Viewer   (based on muo_view_signals.py)
+Tab 2 - Live Histogram  (based on muo_histogram.py)
 
 Key differences from the original CSV-based scripts
 ----------------------------------------------------
 * Data comes directly from the ADS device via a background acquisition
   thread; there is no CSV file to select or poll.
-* "Save traces" checkbox (default OFF) – when OFF only the peak-data
+* "Save traces" checkbox (default OFF) - when OFF only the peak-data
   records (save_records / time_log) are written.  When ON the raw
   waveform rows are also written to a CSV alongside the records log.
 * Auto-delete logic is removed; it is replaced by the save-traces toggle.
@@ -41,9 +41,7 @@ try:
     ADS_AVAILABLE = True
 except Exception as _ads_import_err:
     ADS_AVAILABLE = False
-    print(f"[muo_gui] waveforms_ads import failed: {_ads_import_err}")
-    print("[muo_gui] Running in 'no-hardware' mode – acquisition disabled.")
-
+    print(f"[muon_detector] waveforms_ads import failed: {_ads_import_err}")
 
 # ===========================================================================
 # Shared acquisition layer
@@ -70,10 +68,11 @@ class AcquisitionManager:
         self.buffer_size      = 8192
         self.trigger_level_v  = 0.2       # hardware trigger (rising edge)
         self.trigger_channel  = 0
-        self.auto_timeout_s   = 1.0
         self.acquisition_timeout_s = 5.0
         self.ch0_range_v      = 5.0
         self.ch1_range_v      = 5.0
+        self.ch0_attenuation  = 1.0
+        self.ch1_attenuation  = 1.0
         self.use_ch1          = False
 
         self.status_var: tk.StringVar | None = None  # set by UI
@@ -89,7 +88,7 @@ class AcquisitionManager:
                 return "Already connected"
             try:
                 self.device = WaveFormsADS()
-                return f"Connected – DWF {self.device.get_version()}"
+                return f"Connected - DWF {self.device.get_version()}"
             except Exception as e:
                 self.device = None
                 return f"ERROR: {e}"
@@ -131,20 +130,22 @@ class AcquisitionManager:
     # ------------------------------------------------------------------ #
 
     def _capture_loop(self):
-        """Runs in background thread – continuously captures single waveforms."""
+        """Runs in background thread - continuously captures single waveforms."""
         while not self._stop_event.is_set():
             with self._lock:
                 dev = self.device
             if dev is None:
                 break
             try:
+                #rewrite to use analog_in_capture_multiple. add offset, range?
                 ch0 = dev.analog_in_capture(
                     channel=0,
                     sample_rate_hz=self.sample_rate_hz,
                     buffer_size=self.buffer_size,
                     trigger_level_v=self.trigger_level_v,
                     trigger_channel=self.trigger_channel,
-                    auto_timeout_s=self.auto_timeout_s,
+                    attenuation=self.ch0_attenuation,
+                    auto_timeout_s=0.0,
                     timeout_s=self.acquisition_timeout_s,
                 )
                 ch1 = None
@@ -153,8 +154,9 @@ class AcquisitionManager:
                         channel=1,
                         sample_rate_hz=self.sample_rate_hz,
                         buffer_size=self.buffer_size,
+                        attenuation=self.ch1_attenuation,
                         trigger_level_v=None,          # ch1 free-runs with ch0 trigger
-                        auto_timeout_s=self.auto_timeout_s,
+                        auto_timeout_s=0.0,
                         timeout_s=self.acquisition_timeout_s,
                     )
                 if not self.queue.full():
@@ -281,10 +283,11 @@ class AdsPanel:
         self.buffer_size_var       = tk.IntVar(value=acq.buffer_size)
         self.hw_trigger_var        = tk.DoubleVar(value=acq.trigger_level_v)
         self.hw_trigger_ch_var     = tk.IntVar(value=acq.trigger_channel)
-        self.auto_timeout_var      = tk.DoubleVar(value=acq.auto_timeout_s)
         self.acq_timeout_var       = tk.DoubleVar(value=acq.acquisition_timeout_s)
         self.ch0_range_var         = tk.DoubleVar(value=acq.ch0_range_v)
         self.ch1_range_var         = tk.DoubleVar(value=acq.ch1_range_v)
+        self.ch0_attenuation_var   = tk.DoubleVar(value=acq.ch0_attenuation)
+        self.ch1_attenuation_var   = tk.DoubleVar(value=acq.ch1_attenuation)
 
         self.status_var = tk.StringVar(value="Not connected")
         acq.status_var  = self.status_var
@@ -303,10 +306,11 @@ class AdsPanel:
         self._add(frame, "Buffer size (samples)",     self.buffer_size_var)
         self._add(frame, "HW trigger level (V)",      self.hw_trigger_var)
         self._add(frame, "HW trigger channel (0/1)",  self.hw_trigger_ch_var)
-        self._add(frame, "Auto-timeout (s, 0=strict)",self.auto_timeout_var)
         self._add(frame, "Acq timeout (s)",           self.acq_timeout_var)
         self._add(frame, "Ch0 voltage range (V p-p)", self.ch0_range_var)
         self._add(frame, "Ch1 voltage range (V p-p)", self.ch1_range_var)
+        self._add(frame, "Ch0 attenuation",           self.ch0_attenuation_var)
+        self._add(frame, "Ch1 attenuation",           self.ch1_attenuation_var)
 
         btn_frame = tk.Frame(frame)
         btn_frame.pack(fill="x", pady=(6, 2))
@@ -333,10 +337,11 @@ class AdsPanel:
         a.buffer_size             = self.buffer_size_var.get()
         a.trigger_level_v         = self.hw_trigger_var.get()
         a.trigger_channel         = self.hw_trigger_ch_var.get()
-        a.auto_timeout_s          = self.auto_timeout_var.get()
         a.acquisition_timeout_s   = self.acq_timeout_var.get()
         a.ch0_range_v             = self.ch0_range_var.get()
         a.ch1_range_v             = self.ch1_range_var.get()
+        a.ch0_attenuation         = self.ch0_attenuation_var.get()
+        a.ch1_attenuation         = self.ch1_attenuation_var.get()
         a.use_ch1                 = self.use_ch1_var.get()
 
     def _connect(self):

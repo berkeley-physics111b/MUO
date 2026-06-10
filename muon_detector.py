@@ -278,7 +278,7 @@ class AcquisitionManager:
                 return "Already connected"
             try:
                 self.device = WaveFormsADS()
-                return f"Connected – DWF {self.device.get_version()}"
+                return f"Connected - DWF {self.device.get_version()}"
             except Exception as e:
                 self.device = None
                 return f"ERROR: {e}"
@@ -331,6 +331,8 @@ class AcquisitionManager:
                     channel=0,
                     sample_rate_hz=self.sample_rate_hz,
                     buffer_size=buf,
+                    y_range=self.ch0_range_v,
+                    attenuation=self.ch0_attenuation,
                     trigger_level_v=self.trigger_level_v if self.trigger_channel == 0 else None,
                     trigger_channel=self.trigger_channel,
                     auto_timeout_s=self.auto_timeout_s,
@@ -342,6 +344,8 @@ class AcquisitionManager:
                         channel=1,
                         sample_rate_hz=self.sample_rate_hz,
                         buffer_size=buf,
+                        y_range=self.ch1_range_v,
+                        attenuation=self.ch1_attenuation,
                         trigger_level_v=self.trigger_level_v if self.trigger_channel == 1 else None,
                         trigger_channel=self.trigger_channel,
                         auto_timeout_s=self.auto_timeout_s,
@@ -519,8 +523,6 @@ class AdsPanel:
 
         self.sample_rate_var   = tk.DoubleVar(value=acq.sample_rate_hz)
         self.trigger_ch_var    = tk.IntVar(value=acq.trigger_channel)
-        self.auto_timeout_var  = tk.DoubleVar(value=acq.auto_timeout_s)
-        self.acq_timeout_var   = tk.DoubleVar(value=acq.acquisition_timeout_s)
 
         self.status_var = tk.StringVar(value="Not connected")
         acq.status_var  = self.status_var
@@ -531,8 +533,6 @@ class AdsPanel:
         _section_label(frame, "── ADS Hardware ──")
         add_row(frame, "Sample rate (Hz)",           self.sample_rate_var)
         add_row(frame, "HW trigger channel (0 / 1)", self.trigger_ch_var)
-        add_row(frame, "Auto-timeout (s, 0 = strict)",self.auto_timeout_var)
-        add_row(frame, "Acquisition timeout (s)",    self.acq_timeout_var)
 
         bf = tk.Frame(frame, bg=C["bg"])
         bf.pack(fill="x", pady=(8, 2))
@@ -550,8 +550,6 @@ class AdsPanel:
         a = self.acq
         a.sample_rate_hz        = self.sample_rate_var.get()
         a.trigger_channel       = self.trigger_ch_var.get()
-        a.auto_timeout_s        = self.auto_timeout_var.get()
-        a.acquisition_timeout_s = self.acq_timeout_var.get()
         a.ch0_range_v           = self.ch0_range_var.get()
         a.ch1_range_v           = self.ch1_range_var.get()
         a.ch0_attenuation       = self.ch0_attenuation_var.get()

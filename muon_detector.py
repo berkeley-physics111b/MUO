@@ -581,15 +581,15 @@ class SignalViewerTab:
 
         self.first_trigger_ch0_var = tk.DoubleVar(value=0.2)
         self.trigger_ch0_var       = tk.DoubleVar(value=0.01)
-        self.pulses_ch0_var        = tk.IntVar(value=1)
-        self.ch0_range_var         = tk.DoubleVar(value=5.0)
-        self.ch0_attenuation_var   = tk.DoubleVar(value=1.0)
+        self.pulses_ch0_var        = tk.IntVar(value=2)
+        self.ch0_range_var         = tk.DoubleVar(value=1.0)
+        self.ch0_attenuation_var   = tk.DoubleVar(value=-1.0)
 
         self.first_trigger_ch1_var = tk.DoubleVar(value=0.2)
         self.trigger_ch1_var       = tk.DoubleVar(value=0.01)
         self.pulses_ch1_var        = tk.IntVar(value=1)
-        self.ch1_range_var         = tk.DoubleVar(value=5.0)
-        self.ch1_attenuation_var   = tk.DoubleVar(value=1.0)
+        self.ch1_range_var         = tk.DoubleVar(value=1.0)
+        self.ch1_attenuation_var   = tk.DoubleVar(value=-1.0)
 
         self.fs_var          = tk.DoubleVar(value=100e6)
         self.start_us_var    = tk.DoubleVar(value=0.5)
@@ -1332,8 +1332,7 @@ class HistogramTab:
                       title_size=8, label_size=7, tick_size=6)
             clean = df[data_col].dropna() if data_col in df.columns else pd.Series(dtype=float)
             if len(clean):
-                ax.hist(clean, bins=bins, color=color,
-                        edgecolor=C["plot_bg"], linewidth=0.5)
+                ax.hist(clean, bins=bins, color=color, histtype="stepfilled")
 
         # Full-width dt plots
         _hist("dt_ch0",  "dt_ch0",  C["hist_dt"])

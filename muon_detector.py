@@ -1368,7 +1368,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         _apply_global_theme(root)
 
-        self.acq = AcquisitionManager()
+        #self.acq = AcquisitionManager()
 
         nb = ttk.Notebook(root)
         nb.pack(fill=tk.BOTH, expand=True)
@@ -1378,13 +1378,14 @@ class App:
         nb.add(tab1, text="  Signal Viewer  ")
         nb.add(tab2, text="  Live Histogram  ")
 
-        self.viewer    = SignalViewerTab(tab1, self.acq)
-        self.histogram = HistogramTab(tab2, self.acq)
+        self.viewer    = SignalViewerTab(tab1, AcquisitionManager())
+        self.histogram = HistogramTab(tab2, AcquisitionManager())
 
     def _on_close(self):
         self.viewer.running    = False
         self.histogram.running = False
-        self.acq.disconnect()
+        self.viewer.acq.disconnect()
+        self.histogram.acq.disconnect()
         self.root.quit()
         self.root.destroy()
 

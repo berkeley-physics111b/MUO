@@ -1,22 +1,23 @@
 """
 muon_detector.py
-==========
+================
 Two-tab Tkinter GUI for muon detector data acquisition using the
 Digilent WaveForms ADS hardware (waveforms_ads.py).
 
-Tab 1 - Signal Viewer   (based on muo_view_signals.py)
-Tab 2 - Live Histogram  (based on muo_histogram.py)
+Tab 1 – Signal Viewer
+Tab 2 – Live Histogram
 
-Key differences from the original CSV-based scripts
-----------------------------------------------------
-* Data comes directly from the ADS device via a background acquisition
-  thread; there is no CSV file to select or poll.
-* "Save traces" checkbox (default OFF) - when OFF only the peak-data
-  records (save_records / time_log) are written.  When ON the raw
-  waveform rows are also written to a CSV alongside the records log.
-* Auto-delete logic is removed; it is replaced by the save-traces toggle.
-* Both tabs share a single WaveFormsADS device handle managed by the
-  top-level App object.
+Processing logic
+----------------
+* The hardware trigger fires on the chosen trigger channel at the software
+  first-trigger level for that channel.  The non-trigger channel is captured
+  simultaneously (free-run, same buffer).
+* Expected pulses = 1  → waveform must pass the FIRST trigger only.
+* Expected pulses = 2  → waveform must pass the FIRST trigger AND have a
+  second crossing of the SECOND trigger level within [start_us, stop_us].
+* The full raw buffer is stored / displayed; the start/stop window is used
+  only for second-trigger counting and dt/pulse-2 measurements.
+* Both trigger levels are drawn as dashed lines on every signal plot.
 """
 
 import tkinter as tk
@@ -24,6 +25,7 @@ from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import scipy.signal as sig
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -44,43 +46,231 @@ except Exception as _ads_import_err:
     print(f"[muon_detector] waveforms_ads import failed: {_ads_import_err}")
 
 # ===========================================================================
+# Colour palette  –  dark navy background, gold / amber accents
+# Chosen to be distinguishable for deuteranopia / protanopia.
+# ===========================================================================
+
+C = {
+    "bg":          "#0d1b2a",   # deep navy
+    "sidebar":     "#112240",   # slightly lighter panel
+    "panel":       "#1a2e4a",   # card / section bg
+    "border":      "#1e3a5f",   # separator tint
+    "fg":          "#e8dcc8",   # warm off-white text
+    "fg_dim":      "#8a9bb0",   # muted text
+    "gold":        "#f0a500",   # primary accent (gold)
+    "gold_dim":    "#a06800",   # darker gold for disabled
+    "amber":       "#ffcf47",   # bright highlight
+    "teal":        "#4ecdc4",   # secondary accent (colorblind-safe)
+    "red_warn":    "#e05c5c",   # warning / error
+    "entry_bg":    "#0a1628",   # entry field background
+    "entry_sel":   "#1e3a5f",   # entry selection
+    "btn":         "#1e3a5f",   # button face
+    "btn_active":  "#2a4f7a",   # button hover
+    # matplotlib colours
+    "trace_ch0":   "#4ecdc4",   # teal  – ch0 traces
+    "trace_ch1":   "#f0a500",   # gold  – ch1 traces
+    "trig1":       "#ffcf47",   # amber – first trigger line
+    "trig2":       "#e05c5c",   # red   – second trigger line
+    "hist_dt":     "#4ecdc4",
+    "hist_p1":     "#6dd5a8",   # muted green-teal
+    "hist_p2":     "#f0a500",
+    "plot_bg":     "#0d1b2a",
+    "plot_axes":   "#1a2e4a",
+    "grid":        "#1e3a5f",
+    "tick_fg":     "#8a9bb0",
+}
+
+def _apply_global_theme(root: tk.Tk):
+    """Set ttk + tk default colours on the root window."""
+    root.configure(bg=C["bg"])
+
+    style = ttk.Style(root)
+    # Use a base theme then override
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    style.configure(".",
+        background=C["bg"],
+        foreground=C["fg"],
+        fieldbackground=C["entry_bg"],
+        bordercolor=C["border"],
+        darkcolor=C["bg"],
+        lightcolor=C["panel"],
+        troughcolor=C["bg"],
+        selectbackground=C["entry_sel"],
+        selectforeground=C["amber"],
+        font=("Helvetica", 9),
+    )
+    style.configure("TNotebook",
+        background=C["bg"],
+        bordercolor=C["border"],
+        tabmargins=[2, 4, 2, 0],
+    )
+    style.configure("TNotebook.Tab",
+        background=C["panel"],
+        foreground=C["fg_dim"],
+        padding=[12, 4],
+    )
+    style.map("TNotebook.Tab",
+        background=[("selected", C["sidebar"]), ("active", C["btn_active"])],
+        foreground=[("selected", C["amber"]), ("active", C["fg"])],
+    )
+    style.configure("TFrame", background=C["bg"])
+    style.configure("Vertical.TScrollbar",
+        background=C["panel"],
+        troughcolor=C["bg"],
+        arrowcolor=C["fg_dim"],
+    )
+
+
+def _themed_frame(parent, **kw) -> tk.Frame:
+    return tk.Frame(parent, bg=C["bg"], **kw)
+
+
+def _section_label(parent, text):
+    tk.Label(parent,
+             text=text,
+             bg=C["panel"],
+             fg=C["gold"],
+             font=("Helvetica", 9, "bold"),
+             padx=4, pady=2,
+             anchor="w",
+             ).pack(fill="x", pady=(8, 2))
+
+
+def _field_label(parent, text):
+    tk.Label(parent, text=text, bg=C["bg"], fg=C["fg_dim"],
+             font=("Helvetica", 8), anchor="w").pack(anchor="w")
+
+
+def _entry(parent, var) -> tk.Entry:
+    e = tk.Entry(parent,
+                 textvariable=var,
+                 bg=C["entry_bg"],
+                 fg=C["amber"],
+                 insertbackground=C["amber"],
+                 selectbackground=C["entry_sel"],
+                 selectforeground=C["amber"],
+                 relief="flat",
+                 highlightthickness=1,
+                 highlightbackground=C["border"],
+                 highlightcolor=C["gold"],
+                 font=("Helvetica", 9))
+    e.pack(fill="x", pady=2)
+    return e
+
+
+def _button(parent, text, command, **kw) -> tk.Button:
+    b = tk.Button(parent,
+                  text=text,
+                  command=command,
+                  bg=C["btn"],
+                  fg=C["fg"],
+                  activebackground=C["btn_active"],
+                  activeforeground=C["amber"],
+                  relief="flat",
+                  highlightthickness=0,
+                  cursor="hand2",
+                  font=("Helvetica", 9),
+                  **kw)
+    return b
+
+
+def _checkbutton(parent, text, variable, command=None) -> tk.Checkbutton:
+    kw = dict(command=command) if command else {}
+    return tk.Checkbutton(parent,
+                          text=text,
+                          variable=variable,
+                          bg=C["bg"],
+                          fg=C["fg"],
+                          activebackground=C["bg"],
+                          activeforeground=C["amber"],
+                          selectcolor=C["entry_bg"],
+                          font=("Helvetica", 9),
+                          **kw)
+
+
+def _status_label(parent, var, **kw) -> tk.Label:
+    return tk.Label(parent,
+                    textvariable=var,
+                    bg=C["bg"],
+                    fg=C["teal"],
+                    wraplength=240,
+                    justify="left",
+                    font=("Helvetica", 8),
+                    **kw)
+
+
+def _counter_label(parent, text):
+    tk.Label(parent, text=text, bg=C["bg"], fg=C["fg_dim"],
+             font=("Helvetica", 8)).pack(anchor="w", pady=(6, 0))
+
+
+def _counter_value(parent, var):
+    tk.Label(parent, textvariable=var, bg=C["bg"], fg=C["amber"],
+             font=("Helvetica", 9, "bold")).pack(anchor="w")
+
+
+def _style_figure(fig):
+    """Apply dark theme to a matplotlib Figure."""
+    fig.patch.set_facecolor(C["plot_bg"])
+
+
+def _style_ax(ax, title="", xlabel="", ylabel="", title_size=9,
+              label_size=8, tick_size=7):
+    ax.set_facecolor(C["plot_axes"])
+    ax.tick_params(colors=C["tick_fg"], labelsize=tick_size)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(C["grid"])
+    ax.xaxis.label.set_color(C["tick_fg"])
+    ax.yaxis.label.set_color(C["tick_fg"])
+    ax.title.set_color(C["gold"])
+    ax.grid(True, color=C["grid"], linewidth=0.5, linestyle=":")
+    if title:
+        ax.set_title(title, fontsize=title_size, color=C["gold"])
+    if xlabel:
+        ax.set_xlabel(xlabel, fontsize=label_size)
+    if ylabel:
+        ax.set_ylabel(ylabel, fontsize=label_size)
+
+
+# ===========================================================================
 # Shared acquisition layer
 # ===========================================================================
 
 class AcquisitionManager:
     """
-    Owns the WaveFormsADS device handle and the background capture thread.
-
-    Captured traces are placed in `self.queue` as:
-        {"ch0": np.ndarray, "ch1": np.ndarray | None}
+    Owns the WaveFormsADS device and the background capture thread.
+    Captured traces arrive in self.queue as {"ch0": ndarray, "ch1": ndarray|None}.
     """
 
     def __init__(self):
-        self.device: "WaveFormsADS | None" = None
+        self.device = None
         self.queue: queue.Queue = queue.Queue(maxsize=2000)
-
-        self._thread: threading.Thread | None = None
+        self._thread = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
-        # -- ADS hardware parameters (set from UI before starting) --
-        self.sample_rate_hz   = 100e6
-        self.buffer_size      = 8192
-        self.trigger_level_v  = 0.2       # hardware trigger (rising edge)
-        self.trigger_channel  = 0
+        # Hardware parameters written by AdsPanel before Start
+        self.sample_rate_hz        = 100e6
+        self.trigger_channel       = 0
+        self.auto_timeout_s        = 0.0
         self.acquisition_timeout_s = 5.0
-        self.ch0_range_v      = 5.0
-        self.ch1_range_v      = 5.0
-        self.ch0_attenuation  = 1.0
-        self.ch1_attenuation  = 1.0
-        self.use_ch1          = False
+        self.ch0_range_v           = 5.0
+        self.ch1_range_v           = 5.0
+        self.ch0_attenuation       = 1.0
+        self.ch1_attenuation       = 1.0
+        self.use_ch1               = False
+        # trigger_level_v is derived from the UI first-trigger of the trigger channel
+        self.trigger_level_v       = 0.2
 
-        self.status_var: tk.StringVar | None = None  # set by UI
+        self.status_var = None  # tk.StringVar set by AdsPanel
 
     # ------------------------------------------------------------------ #
 
     def connect(self) -> str:
-        """Open the first available ADS device. Returns status string."""
         if not ADS_AVAILABLE:
             return "ERROR: waveforms_ads not importable"
         with self._lock:
@@ -88,7 +278,7 @@ class AcquisitionManager:
                 return "Already connected"
             try:
                 self.device = WaveFormsADS()
-                return f"Connected - DWF {self.device.get_version()}"
+                return f"Connected – DWF {self.device.get_version()}"
             except Exception as e:
                 self.device = None
                 return f"ERROR: {e}"
@@ -103,10 +293,7 @@ class AcquisitionManager:
                     pass
                 self.device = None
 
-    # ------------------------------------------------------------------ #
-
     def start_acquisition(self) -> str:
-        """Start the background capture thread. Returns status string."""
         with self._lock:
             if self.device is None:
                 return "Not connected"
@@ -130,22 +317,23 @@ class AcquisitionManager:
     # ------------------------------------------------------------------ #
 
     def _capture_loop(self):
-        """Runs in background thread - continuously captures single waveforms."""
+        # Compute buffer size from sample_rate and a 200 µs window (generous)
+        buf = max(4096, int(self.sample_rate_hz * 400e-6))
+        buf = min(buf, 32768)
+
         while not self._stop_event.is_set():
             with self._lock:
                 dev = self.device
             if dev is None:
                 break
             try:
-                #rewrite to use analog_in_capture_multiple. add offset, range?
                 ch0 = dev.analog_in_capture(
                     channel=0,
                     sample_rate_hz=self.sample_rate_hz,
-                    buffer_size=self.buffer_size,
-                    trigger_level_v=self.trigger_level_v,
+                    buffer_size=buf,
+                    trigger_level_v=self.trigger_level_v if self.trigger_channel == 0 else None,
                     trigger_channel=self.trigger_channel,
-                    attenuation=self.ch0_attenuation,
-                    auto_timeout_s=0.0,
+                    auto_timeout_s=self.auto_timeout_s,
                     timeout_s=self.acquisition_timeout_s,
                 )
                 ch1 = None
@@ -153,23 +341,23 @@ class AcquisitionManager:
                     ch1 = dev.analog_in_capture(
                         channel=1,
                         sample_rate_hz=self.sample_rate_hz,
-                        buffer_size=self.buffer_size,
-                        attenuation=self.ch1_attenuation,
-                        trigger_level_v=None,          # ch1 free-runs with ch0 trigger
-                        auto_timeout_s=0.0,
+                        buffer_size=buf,
+                        trigger_level_v=self.trigger_level_v if self.trigger_channel == 1 else None,
+                        trigger_channel=self.trigger_channel,
+                        auto_timeout_s=self.auto_timeout_s,
                         timeout_s=self.acquisition_timeout_s,
                     )
                 if not self.queue.full():
                     self.queue.put_nowait({"ch0": ch0, "ch1": ch1})
             except TimeoutError:
-                pass   # no trigger – loop and try again
+                pass
             except Exception as e:
                 if self._stop_event.is_set():
                     break
                 self._set_status(f"Capture error: {e}")
                 time.sleep(0.5)
 
-    def _set_status(self, msg: str):
+    def _set_status(self, msg):
         if self.status_var is not None:
             try:
                 self.status_var.set(msg)
@@ -178,7 +366,7 @@ class AcquisitionManager:
 
 
 # ===========================================================================
-# Shared signal-processing helpers (used by both tabs)
+# Shared signal-processing helpers
 # ===========================================================================
 
 def find_first_trigger_index(row, level):
@@ -187,7 +375,7 @@ def find_first_trigger_index(row, level):
     return int(rising[0]) if len(rising) > 0 else None
 
 
-def count_pulses(window, trigger_level, holdoff_samples):
+def count_pulses_in_window(window, trigger_level, holdoff_samples):
     above  = window >= trigger_level
     rising = np.where(~above[:-1] & above[1:])[0] + 1
     if len(rising) == 0:
@@ -227,24 +415,56 @@ def measure_pulse(window, fs, half_width_only=False):
                 break
         fwhm_us = (np.nan if (np.isnan(left_idx) or np.isnan(right_idx))
                    else (right_idx - left_idx) / fs * 1e6)
-
     return height, fwhm_us
+
+
+def passes_trigger_logic(
+    raw, fs, first_trig, second_trig, expected_pulses,
+    start_idx, stop_idx, holdoff_samples, do_filter, b=None, a_coef=None
+):
+    """
+    Returns True if `raw` satisfies the expected-pulse criterion.
+
+    expected_pulses == 1  → must cross first_trig at least once (anywhere)
+    expected_pulses == 2  → must cross first_trig AND cross second_trig
+                            at least once inside [start_idx, stop_idx)
+    """
+    # First trigger: anywhere in the full trace
+    cross = find_first_trigger_index(raw, first_trig)
+    if cross is None:
+        return False, None
+
+    if expected_pulses == 1:
+        return True, cross
+
+    # Second trigger: within the analysis window, after filtering
+    chopped = raw[cross:]
+    if stop_idx > len(chopped):
+        return False, cross
+
+    win = chopped[start_idx:stop_idx]
+    filt = (sig.filtfilt(b, a_coef, win)
+            if (do_filter and len(win) > 9)
+            else win.copy())
+    if count_pulses_in_window(filt, second_trig, holdoff_samples) >= 1:
+        return True, cross
+    return False, cross
 
 
 # ===========================================================================
 # Shared scrollable sidebar builder
 # ===========================================================================
 
-def make_scrollable_sidebar(parent, width=270):
-    """Return (outer_container, inner_frame, scrollable_canvas)."""
-    container = tk.Frame(parent)
-    canvas    = tk.Canvas(container, width=width, highlightthickness=0)
-    scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
+def make_scrollable_sidebar(parent, width=275):
+    container  = tk.Frame(parent, bg=C["sidebar"])
+    canvas     = tk.Canvas(container, width=width, highlightthickness=0,
+                           bg=C["sidebar"])
+    scrollbar  = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
     canvas.configure(yscrollcommand=scrollbar.set)
     scrollbar.pack(side=tk.RIGHT, fill="y")
     canvas.pack(side=tk.LEFT, fill="y", expand=True)
 
-    frame        = tk.Frame(canvas)
+    frame        = tk.Frame(canvas, bg=C["bg"])
     frame_window = canvas.create_window((0, 0), window=frame, anchor="nw")
 
     def _on_frame(event):
@@ -263,90 +483,89 @@ def make_scrollable_sidebar(parent, width=270):
     return container, frame, canvas
 
 
+def add_row(frame, label, var):
+    _field_label(frame, label)
+    _entry(frame, var)
+
+
 # ===========================================================================
-# ADS settings sub-panel (shared by both tabs via reference to acq manager)
+# ADS + shared-settings panel
 # ===========================================================================
 
 class AdsPanel:
     """
-    Builds the 'ADS Hardware' section inside a given parent frame.
-    Reads/writes values on the shared AcquisitionManager.
+    Single merged settings panel: Ch0, Ch1, shared acquisition, ADS hardware,
+    device control.  The panel holds references to the per-channel first-trigger
+    vars so it can push the correct level to AcquisitionManager on Start.
     """
 
-    def __init__(self, frame: tk.Frame, acq: AcquisitionManager,
-                 use_ch1_var: tk.BooleanVar):
-        self.acq         = acq
-        self.use_ch1_var = use_ch1_var
+    def __init__(self, frame, acq: AcquisitionManager,
+                 use_ch1_var: tk.BooleanVar,
+                 first_trigger_ch0_var: tk.DoubleVar,
+                 first_trigger_ch1_var: tk.DoubleVar,
+                 ch0_range_var: tk.DoubleVar,
+                 ch1_range_var: tk.DoubleVar,
+                 ch0_attenuation_var: tk.DoubleVar,
+                 ch1_attenuation_var: tk.DoubleVar):
 
-        # ---- Tk vars mirroring AcquisitionManager fields ----
-        self.sample_rate_var       = tk.DoubleVar(value=acq.sample_rate_hz)
-        self.buffer_size_var       = tk.IntVar(value=acq.buffer_size)
-        self.hw_trigger_var        = tk.DoubleVar(value=acq.trigger_level_v)
-        self.hw_trigger_ch_var     = tk.IntVar(value=acq.trigger_channel)
-        self.acq_timeout_var       = tk.DoubleVar(value=acq.acquisition_timeout_s)
-        self.ch0_range_var         = tk.DoubleVar(value=acq.ch0_range_v)
-        self.ch1_range_var         = tk.DoubleVar(value=acq.ch1_range_v)
-        self.ch0_attenuation_var   = tk.DoubleVar(value=acq.ch0_attenuation)
-        self.ch1_attenuation_var   = tk.DoubleVar(value=acq.ch1_attenuation)
+        self.acq                   = acq
+        self.use_ch1_var           = use_ch1_var
+        self.first_trigger_ch0_var = first_trigger_ch0_var
+        self.first_trigger_ch1_var = first_trigger_ch1_var
+        self.ch0_range_var         = ch0_range_var
+        self.ch1_range_var         = ch1_range_var
+        self.ch0_attenuation_var   = ch0_attenuation_var
+        self.ch1_attenuation_var   = ch1_attenuation_var
+
+        self.sample_rate_var   = tk.DoubleVar(value=acq.sample_rate_hz)
+        self.trigger_ch_var    = tk.IntVar(value=acq.trigger_channel)
+        self.auto_timeout_var  = tk.DoubleVar(value=acq.auto_timeout_s)
+        self.acq_timeout_var   = tk.DoubleVar(value=acq.acquisition_timeout_s)
 
         self.status_var = tk.StringVar(value="Not connected")
         acq.status_var  = self.status_var
 
         self._build(frame)
 
-    def _add(self, frame, label, var):
-        tk.Label(frame, text=label).pack(anchor="w")
-        tk.Entry(frame, textvariable=var).pack(fill="x", pady=2)
-
     def _build(self, frame):
-        tk.Label(frame, text="── ADS Hardware ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(10, 2))
+        _section_label(frame, "── ADS Hardware ──")
+        add_row(frame, "Sample rate (Hz)",           self.sample_rate_var)
+        add_row(frame, "HW trigger channel (0 / 1)", self.trigger_ch_var)
+        add_row(frame, "Auto-timeout (s, 0 = strict)",self.auto_timeout_var)
+        add_row(frame, "Acquisition timeout (s)",    self.acq_timeout_var)
 
-        self._add(frame, "Sample rate (Hz)",          self.sample_rate_var)
-        self._add(frame, "Buffer size (samples)",     self.buffer_size_var)
-        self._add(frame, "HW trigger level (V)",      self.hw_trigger_var)
-        self._add(frame, "HW trigger channel (0/1)",  self.hw_trigger_ch_var)
-        self._add(frame, "Acq timeout (s)",           self.acq_timeout_var)
-        self._add(frame, "Ch0 voltage range (V p-p)", self.ch0_range_var)
-        self._add(frame, "Ch1 voltage range (V p-p)", self.ch1_range_var)
-        self._add(frame, "Ch0 attenuation",           self.ch0_attenuation_var)
-        self._add(frame, "Ch1 attenuation",           self.ch1_attenuation_var)
+        bf = tk.Frame(frame, bg=C["bg"])
+        bf.pack(fill="x", pady=(8, 2))
+        _button(bf, "Connect",    self._connect,    width=10).pack(side=tk.LEFT, padx=2)
+        _button(bf, "Disconnect", self._disconnect, width=10).pack(side=tk.LEFT, padx=2)
 
-        btn_frame = tk.Frame(frame)
-        btn_frame.pack(fill="x", pady=(6, 2))
-        tk.Button(btn_frame, text="Connect",    command=self._connect,
-                  width=10).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_frame, text="Disconnect", command=self._disconnect,
-                  width=10).pack(side=tk.LEFT, padx=2)
+        bf2 = tk.Frame(frame, bg=C["bg"])
+        bf2.pack(fill="x", pady=2)
+        _button(bf2, "▶ Start", self._start, width=10).pack(side=tk.LEFT, padx=2)
+        _button(bf2, "■ Stop",  self._stop,  width=10).pack(side=tk.LEFT, padx=2)
 
-        btn_frame2 = tk.Frame(frame)
-        btn_frame2.pack(fill="x", pady=2)
-        tk.Button(btn_frame2, text="▶ Start",   command=self._start,
-                  width=10).pack(side=tk.LEFT, padx=2)
-        tk.Button(btn_frame2, text="■ Stop",    command=self._stop,
-                  width=10).pack(side=tk.LEFT, padx=2)
-
-        tk.Label(frame, textvariable=self.status_var,
-                 fg="darkblue", wraplength=240,
-                 justify="left", font=("", 8)).pack(anchor="w", pady=(4, 0))
+        _status_label(frame, self.status_var).pack(anchor="w", pady=(4, 0))
 
     def _push_to_acq(self):
-        """Write current UI values into the AcquisitionManager."""
         a = self.acq
-        a.sample_rate_hz          = self.sample_rate_var.get()
-        a.buffer_size             = self.buffer_size_var.get()
-        a.trigger_level_v         = self.hw_trigger_var.get()
-        a.trigger_channel         = self.hw_trigger_ch_var.get()
-        a.acquisition_timeout_s   = self.acq_timeout_var.get()
-        a.ch0_range_v             = self.ch0_range_var.get()
-        a.ch1_range_v             = self.ch1_range_var.get()
-        a.ch0_attenuation         = self.ch0_attenuation_var.get()
-        a.ch1_attenuation         = self.ch1_attenuation_var.get()
-        a.use_ch1                 = self.use_ch1_var.get()
+        a.sample_rate_hz        = self.sample_rate_var.get()
+        a.trigger_channel       = self.trigger_ch_var.get()
+        a.auto_timeout_s        = self.auto_timeout_var.get()
+        a.acquisition_timeout_s = self.acq_timeout_var.get()
+        a.ch0_range_v           = self.ch0_range_var.get()
+        a.ch1_range_v           = self.ch1_range_var.get()
+        a.ch0_attenuation       = self.ch0_attenuation_var.get()
+        a.ch1_attenuation       = self.ch1_attenuation_var.get()
+        a.use_ch1               = self.use_ch1_var.get()
+        # HW trigger level = first-trigger of the chosen trigger channel
+        tch = self.trigger_ch_var.get()
+        if tch == 1:
+            a.trigger_level_v = self.first_trigger_ch1_var.get()
+        else:
+            a.trigger_level_v = self.first_trigger_ch0_var.get()
 
     def _connect(self):
-        msg = self.acq.connect()
-        self.status_var.set(msg)
+        self.status_var.set(self.acq.connect())
 
     def _disconnect(self):
         self.acq.disconnect()
@@ -354,8 +573,7 @@ class AdsPanel:
 
     def _start(self):
         self._push_to_acq()
-        msg = self.acq.start_acquisition()
-        self.status_var.set(msg)
+        self.status_var.set(self.acq.start_acquisition())
 
     def _stop(self):
         self.acq.stop_acquisition()
@@ -372,29 +590,37 @@ class SignalViewerTab:
         self.acq     = acq
         self.running = True
 
-        self.displayed_ch0: list = []
+        self.displayed_ch0: list = []   # full raw traces that passed
         self.displayed_ch1: list = []
         self.total_counts  = 0
 
         # ---- Tk vars ----
         self.use_ch1_var           = tk.BooleanVar(value=False)
+
         self.first_trigger_ch0_var = tk.DoubleVar(value=0.2)
         self.trigger_ch0_var       = tk.DoubleVar(value=0.01)
         self.pulses_ch0_var        = tk.IntVar(value=1)
+        self.ch0_range_var         = tk.DoubleVar(value=5.0)
+        self.ch0_attenuation_var   = tk.DoubleVar(value=1.0)
+
         self.first_trigger_ch1_var = tk.DoubleVar(value=0.2)
         self.trigger_ch1_var       = tk.DoubleVar(value=0.01)
         self.pulses_ch1_var        = tk.IntVar(value=1)
-        self.fs_var                = tk.DoubleVar(value=100e6)
-        self.start_us_var          = tk.DoubleVar(value=0.5)
-        self.stop_us_var           = tk.DoubleVar(value=40.0)
-        self.filter_var            = tk.DoubleVar(value=100e6)
-        self.holdoff_us_var        = tk.DoubleVar(value=0.5)
-        self.max_display_var       = tk.IntVar(value=50)
-        self.save_traces_var       = tk.BooleanVar(value=False)
-        self.counts_var            = tk.IntVar(value=0)
-        self.passing_var           = tk.IntVar(value=0)
+        self.ch1_range_var         = tk.DoubleVar(value=5.0)
+        self.ch1_attenuation_var   = tk.DoubleVar(value=1.0)
 
-        self.trace_csv_path: str | None = None
+        self.fs_var          = tk.DoubleVar(value=100e6)
+        self.start_us_var    = tk.DoubleVar(value=0.5)
+        self.stop_us_var     = tk.DoubleVar(value=40.0)
+        self.filter_var      = tk.DoubleVar(value=100e6)
+        self.holdoff_us_var  = tk.DoubleVar(value=0.5)
+        self.max_display_var = tk.IntVar(value=50)
+
+        self.save_traces_var = tk.BooleanVar(value=False)
+        self.counts_var      = tk.IntVar(value=0)
+        self.passing_var     = tk.IntVar(value=0)
+
+        self.trace_csv_path = None
 
         self._build(parent)
         parent.after(500, self._update_loop)
@@ -405,74 +631,80 @@ class SignalViewerTab:
         sidebar_container, frame, _ = make_scrollable_sidebar(parent)
         sidebar_container.pack(side=tk.LEFT, fill="y")
 
-        def add_row(label, var):
-            tk.Label(frame, text=label).pack(anchor="w")
-            tk.Entry(frame, textvariable=var).pack(fill="x", pady=2)
-
         # Ch0
-        tk.Label(frame, text="── Channel 0 ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(4, 2))
-        add_row("Ch0 first trigger level (V)",  self.first_trigger_ch0_var)
-        add_row("Ch0 second trigger level (V)", self.trigger_ch0_var)
-        add_row("Ch0 expected pulse count",     self.pulses_ch0_var)
+        _section_label(frame, "── Channel 0 ──")
+        add_row(frame, "First trigger level (V)",  self.first_trigger_ch0_var)
+        add_row(frame, "Second trigger level (V)", self.trigger_ch0_var)
+        add_row(frame, "Expected pulses (1 or 2)", self.pulses_ch0_var)
+        add_row(frame, "Voltage range (V p-p)",    self.ch0_range_var)
+        add_row(frame, "Attenuation",              self.ch0_attenuation_var)
 
         # Ch1
-        tk.Label(frame, text="── Channel 1 ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(8, 2))
-        tk.Checkbutton(frame, text="Use Channel 1", variable=self.use_ch1_var,
-                       command=self._toggle_ch1).pack(anchor="w")
+        _section_label(frame, "── Channel 1 ──")
+        _checkbutton(frame, "Use Channel 1", self.use_ch1_var,
+                     command=self._toggle_ch1).pack(anchor="w", pady=(2, 4))
         self.ch1_widgets = []
 
         def add_ch1_row(label, var):
-            lbl = tk.Label(frame, text=label)
+            lbl = tk.Label(frame, text=label, bg=C["bg"], fg=C["fg_dim"],
+                           font=("Helvetica", 8), anchor="w")
             lbl.pack(anchor="w")
-            ent = tk.Entry(frame, textvariable=var)
-            ent.pack(fill="x", pady=2)
+            ent = _entry(frame, var)
             self.ch1_widgets += [lbl, ent]
 
-        add_ch1_row("Ch1 first trigger level (V)",  self.first_trigger_ch1_var)
-        add_ch1_row("Ch1 second trigger level (V)", self.trigger_ch1_var)
-        add_ch1_row("Ch1 expected pulse count",     self.pulses_ch1_var)
+        add_ch1_row("First trigger level (V)",  self.first_trigger_ch1_var)
+        add_ch1_row("Second trigger level (V)", self.trigger_ch1_var)
+        add_ch1_row("Expected pulses (1 or 2)", self.pulses_ch1_var)
+        add_ch1_row("Voltage range (V p-p)",    self.ch1_range_var)
+        add_ch1_row("Attenuation",              self.ch1_attenuation_var)
 
-        # Shared
-        tk.Label(frame, text="── Shared ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(8, 2))
-        add_row("Sampling frequency (Hz)",       self.fs_var)
-        add_row("Low-pass cutoff (Hz)",          self.filter_var)
-        add_row("Start time after trigger (µs)", self.start_us_var)
-        add_row("Stop time after trigger (µs)",  self.stop_us_var)
-        add_row("Holdoff (µs)",                  self.holdoff_us_var)
-        add_row("Max traces to display",         self.max_display_var)
+        # Acquisition / shared
+        _section_label(frame, "── Acquisition ──")
+        add_row(frame, "Sample rate (Hz)",            self.fs_var)
+        add_row(frame, "Low-pass cutoff (Hz)",        self.filter_var)
+        add_row(frame, "Window start after trig (µs)",self.start_us_var)
+        add_row(frame, "Window stop after trig (µs)", self.stop_us_var)
+        add_row(frame, "Holdoff (µs)",                self.holdoff_us_var)
+        add_row(frame, "Max traces to display",       self.max_display_var)
 
-        tk.Button(frame, text="Reset", command=self._reset).pack(fill="x", pady=4)
+        _button(frame, "Reset", self._reset).pack(fill="x", pady=(8, 4))
 
-        # Save traces
-        tk.Label(frame, text="── Data Saving ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(10, 2))
-        tk.Checkbutton(frame, text="Save raw traces to CSV",
-                       variable=self.save_traces_var,
-                       command=self._toggle_save_traces).pack(anchor="w")
+        # Data saving
+        _section_label(frame, "── Data Saving ──")
+        _checkbutton(frame, "Save raw traces to CSV",
+                     self.save_traces_var,
+                     command=self._toggle_save_traces).pack(anchor="w")
         self.trace_path_label = tk.Label(frame, text="(traces not saved)",
+                                         bg=C["bg"], fg=C["fg_dim"],
                                          wraplength=230, justify="left",
-                                         fg="gray", font=("", 8))
+                                         font=("Helvetica", 8))
         self.trace_path_label.pack(anchor="w")
 
-        # ADS panel
-        self.ads_panel = AdsPanel(frame, self.acq, self.use_ch1_var)
+        # ADS hardware panel
+        self.ads_panel = AdsPanel(
+            frame, self.acq, self.use_ch1_var,
+            self.first_trigger_ch0_var, self.first_trigger_ch1_var,
+            self.ch0_range_var, self.ch1_range_var,
+            self.ch0_attenuation_var, self.ch1_attenuation_var,
+        )
 
         # Counters
-        tk.Label(frame, text="Counts (events read):").pack(anchor="w", pady=(10, 0))
-        tk.Label(frame, textvariable=self.counts_var).pack(anchor="w")
-        tk.Label(frame, text="Passing events:").pack(anchor="w", pady=(6, 0))
-        tk.Label(frame, textvariable=self.passing_var).pack(anchor="w")
+        _section_label(frame, "── Status ──")
+        _counter_label(frame, "Events read:")
+        _counter_value(frame, self.counts_var)
+        _counter_label(frame, "Passing events:")
+        _counter_value(frame, self.passing_var)
 
         self._toggle_ch1()
         self._build_plot(parent)
 
     def _build_plot(self, parent):
+        plot_frame = tk.Frame(parent, bg=C["plot_bg"])
+        plot_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         self.fig    = plt.Figure(figsize=(10, 6))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
-        self.canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        _style_figure(self.fig)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._rebuild_axes()
 
     def _rebuild_axes(self):
@@ -480,10 +712,13 @@ class SignalViewerTab:
         use_ch1 = self.use_ch1_var.get()
         if use_ch1:
             self.ax0, self.ax1 = self.fig.subplots(2, 1, sharex=True)
+            _style_ax(self.ax1, xlabel="Time (µs)", ylabel="Amplitude (V)")
         else:
             self.ax0 = self.fig.subplots(1, 1)
             self.ax1 = None
-        self.fig.tight_layout()
+            _style_ax(self.ax0, xlabel="Time (µs)", ylabel="Amplitude (V)")
+        _style_ax(self.ax0, ylabel="Amplitude (V)")
+        self.fig.tight_layout(pad=1.5)
         self.canvas.draw()
 
     def _toggle_ch1(self):
@@ -495,6 +730,14 @@ class SignalViewerTab:
 
     def _toggle_save_traces(self):
         if self.save_traces_var.get():
+            if not messagebox.askokcancel(
+                "Memory warning",
+                "Saving raw traces can consume many GB of disk space during "
+                "long runs.\n\nProceed and choose a file?",
+                icon="warning"
+            ):
+                self.save_traces_var.set(False)
+                return
             path = filedialog.asksaveasfilename(
                 title="Save traces CSV",
                 defaultextension=".csv",
@@ -502,13 +745,15 @@ class SignalViewerTab:
             )
             if path:
                 self.trace_csv_path = path
-                self.trace_path_label.config(text=os.path.basename(path), fg="darkgreen")
+                self.trace_path_label.config(text=os.path.basename(path),
+                                             fg=C["teal"])
             else:
                 self.save_traces_var.set(False)
-                self.trace_path_label.config(text="(traces not saved)", fg="gray")
+                self.trace_path_label.config(text="(traces not saved)",
+                                             fg=C["fg_dim"])
         else:
             self.trace_csv_path = None
-            self.trace_path_label.config(text="(traces not saved)", fg="gray")
+            self.trace_path_label.config(text="(traces not saved)", fg=C["fg_dim"])
 
     def _reset(self):
         self.displayed_ch0.clear()
@@ -530,17 +775,14 @@ class SignalViewerTab:
             pass
 
     def _drain_queue(self):
-        """Process up to 50 buffered waveforms per tick."""
         batch = []
         for _ in range(50):
             try:
-                item = self.acq.queue.get_nowait()
-                batch.append(item)
+                batch.append(self.acq.queue.get_nowait())
             except queue.Empty:
                 break
-        if not batch:
-            return
-        self._process_batch(batch)
+        if batch:
+            self._process_batch(batch)
 
     def _process_batch(self, batch):
         fs              = self.fs_var.get()
@@ -559,6 +801,7 @@ class SignalViewerTab:
 
         nyq       = fs / 2.0
         do_filter = 0 < fc < nyq
+        b = a_coef = None
         if do_filter:
             b, a_coef = sig.butter(4, fc / nyq, btype="low")
 
@@ -570,43 +813,30 @@ class SignalViewerTab:
             raw_ch0 = item["ch0"]
             self.total_counts += 1
 
-            cross_ch0 = find_first_trigger_index(raw_ch0, first_trig_ch0)
-            if cross_ch0 is None:
-                continue
-            chopped_ch0 = raw_ch0[cross_ch0:]
-            if stop_idx > len(chopped_ch0):
-                continue
-            win_ch0  = chopped_ch0[start_idx:stop_idx]
-            filt_ch0 = (sig.filtfilt(b, a_coef, win_ch0) if do_filter
-                        else win_ch0.copy())
-            if count_pulses(filt_ch0, trig_ch0, holdoff_samples) != pulses_ch0:
+            ok_ch0, _ = passes_trigger_logic(
+                raw_ch0, fs, first_trig_ch0, trig_ch0, pulses_ch0,
+                start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef
+            )
+            if not ok_ch0:
                 continue
 
             if use_ch1 and item["ch1"] is not None:
-                raw_ch1   = item["ch1"]
-                cross_ch1 = find_first_trigger_index(raw_ch1, first_trig_ch1)
-                if cross_ch1 is None:
+                raw_ch1 = item["ch1"]
+                ok_ch1, _ = passes_trigger_logic(
+                    raw_ch1, fs, first_trig_ch1, trig_ch1, pulses_ch1,
+                    start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef
+                )
+                if not ok_ch1:
                     continue
-                chopped_ch1 = raw_ch1[cross_ch1:]
-                if stop_idx > len(chopped_ch1):
-                    continue
-                win_ch1  = chopped_ch1[start_idx:stop_idx]
-                filt_ch1 = (sig.filtfilt(b, a_coef, win_ch1) if do_filter
-                            else win_ch1.copy())
-                if count_pulses(filt_ch1, trig_ch1, holdoff_samples) != pulses_ch1:
-                    continue
-                new_ch1.append(win_ch1)
+                new_ch1.append(raw_ch1)
                 if self.save_traces_var.get():
-                    trace_rows.append(win_ch0.tolist())
-                    trace_rows.append(win_ch1.tolist())
-            else:
-                if self.save_traces_var.get():
-                    trace_rows.append(win_ch0.tolist())
+                    trace_rows.append(raw_ch1.tolist())
 
-            new_ch0.append(win_ch0)
+            new_ch0.append(raw_ch0)
+            if self.save_traces_var.get():
+                trace_rows.append(raw_ch0.tolist())
 
         self.counts_var.set(self.total_counts)
-
         if not new_ch0:
             return
 
@@ -615,11 +845,10 @@ class SignalViewerTab:
             self.displayed_ch1.extend(new_ch1)
         self.passing_var.set(len(self.displayed_ch0))
 
-        # optionally save raw traces
         if self.save_traces_var.get() and trace_rows and self.trace_csv_path:
             self._append_trace_csv(trace_rows)
 
-        self._update_plot(fs, start_idx)
+        self._update_plot(fs)
 
     def _append_trace_csv(self, rows):
         try:
@@ -630,37 +859,49 @@ class SignalViewerTab:
         except Exception as e:
             print(f"[SignalViewer] trace CSV write error: {e}")
 
-    def _update_plot(self, fs, start_idx):
+    def _update_plot(self, fs):
         use_ch1     = self.use_ch1_var.get()
         max_display = self.max_display_var.get()
-        n_pts       = self.displayed_ch0[-1].shape[0]
-        time_us     = (np.arange(n_pts) + start_idx) / fs * 1e6
+        n_pts       = len(self.displayed_ch0[-1])
+        time_us     = np.arange(n_pts) / fs * 1e6
+
+        first_trig_ch0 = self.first_trigger_ch0_var.get()
+        trig_ch0       = self.trigger_ch0_var.get()
 
         self.ax0.clear()
+        _style_ax(self.ax0,
+                  title=f"Channel 0 — last {min(len(self.displayed_ch0), max_display)} traces",
+                  ylabel="Amplitude (V)")
         for trace in self.displayed_ch0[-max_display:]:
-            self.ax0.plot(time_us, trace, color="steelblue", alpha=0.3, linewidth=0.8)
-        self.ax0.axhline(self.trigger_ch0_var.get(), color="red", linestyle="--",
-                         linewidth=1, label="Second trigger")
-        self.ax0.set_ylabel("Amplitude (V)")
-        self.ax0.set_title(
-            f"Channel 0 — last {min(len(self.displayed_ch0), max_display)} traces")
-        self.ax0.legend(fontsize=7)
+            self.ax0.plot(time_us[:len(trace)], trace,
+                          color=C["trace_ch0"], alpha=0.3, linewidth=0.7)
+        self.ax0.axhline(first_trig_ch0, color=C["trig1"], linestyle="--",
+                         linewidth=1.0, label=f"First trig ({first_trig_ch0:.3g} V)")
+        self.ax0.axhline(trig_ch0, color=C["trig2"], linestyle="--",
+                         linewidth=1.0, label=f"Second trig ({trig_ch0:.3g} V)")
+        self.ax0.legend(fontsize=7, facecolor=C["panel"],
+                        edgecolor=C["border"], labelcolor=C["fg"])
 
         if use_ch1 and self.ax1 is not None and self.displayed_ch1:
+            first_trig_ch1 = self.first_trigger_ch1_var.get()
+            trig_ch1       = self.trigger_ch1_var.get()
             self.ax1.clear()
+            _style_ax(self.ax1,
+                      title=f"Channel 1 — last {min(len(self.displayed_ch1), max_display)} traces",
+                      xlabel="Time (µs)", ylabel="Amplitude (V)")
             for trace in self.displayed_ch1[-max_display:]:
-                self.ax1.plot(time_us, trace, color="darkorange", alpha=0.3, linewidth=0.8)
-            self.ax1.axhline(self.trigger_ch1_var.get(), color="red", linestyle="--",
-                             linewidth=1, label="Second trigger")
-            self.ax1.set_xlabel("Time after first trigger (µs)")
-            self.ax1.set_ylabel("Amplitude (V)")
-            self.ax1.set_title(
-                f"Channel 1 — last {min(len(self.displayed_ch1), max_display)} traces")
-            self.ax1.legend(fontsize=7)
-        else:
-            self.ax0.set_xlabel("Time after first trigger (µs)")
+                self.ax1.plot(time_us[:len(trace)], trace,
+                              color=C["trace_ch1"], alpha=0.3, linewidth=0.7)
+            self.ax1.axhline(first_trig_ch1, color=C["trig1"], linestyle="--",
+                             linewidth=1.0, label=f"First trig ({first_trig_ch1:.3g} V)")
+            self.ax1.axhline(trig_ch1, color=C["trig2"], linestyle="--",
+                             linewidth=1.0, label=f"Second trig ({trig_ch1:.3g} V)")
+            self.ax1.legend(fontsize=7, facecolor=C["panel"],
+                            edgecolor=C["border"], labelcolor=C["fg"])
+        elif not use_ch1:
+            self.ax0.set_xlabel("Time (µs)")
 
-        self.fig.tight_layout()
+        self.fig.tight_layout(pad=1.5)
         self.canvas.draw()
 
 
@@ -679,24 +920,32 @@ class HistogramTab:
 
         # ---- Tk vars ----
         self.use_ch1_var           = tk.BooleanVar(value=False)
+
         self.first_trigger_ch0_var = tk.DoubleVar(value=0.2)
         self.trigger_ch0_var       = tk.DoubleVar(value=0.01)
         self.pulses_ch0_var        = tk.IntVar(value=1)
+        self.ch0_range_var         = tk.DoubleVar(value=5.0)
+        self.ch0_attenuation_var   = tk.DoubleVar(value=1.0)
+
         self.first_trigger_ch1_var = tk.DoubleVar(value=0.2)
         self.trigger_ch1_var       = tk.DoubleVar(value=0.01)
         self.pulses_ch1_var        = tk.IntVar(value=1)
-        self.fs_var                = tk.DoubleVar(value=100e6)
-        self.start_us_var          = tk.DoubleVar(value=0.5)
-        self.stop_us_var           = tk.DoubleVar(value=40.0)
-        self.bins_var              = tk.IntVar(value=100)
-        self.filter_var            = tk.DoubleVar(value=100e6)
-        self.holdoff_us_var        = tk.DoubleVar(value=0.5)
-        self.save_traces_var       = tk.BooleanVar(value=False)
-        self.counts_var            = tk.IntVar(value=0)
-        self.triggers_var          = tk.IntVar(value=0)
+        self.ch1_range_var         = tk.DoubleVar(value=5.0)
+        self.ch1_attenuation_var   = tk.DoubleVar(value=1.0)
 
-        self.time_log_path: str | None  = None
-        self.trace_csv_path: str | None = None
+        self.fs_var          = tk.DoubleVar(value=100e6)
+        self.start_us_var    = tk.DoubleVar(value=0.5)
+        self.stop_us_var     = tk.DoubleVar(value=40.0)
+        self.bins_var        = tk.IntVar(value=100)
+        self.filter_var      = tk.DoubleVar(value=100e6)
+        self.holdoff_us_var  = tk.DoubleVar(value=0.5)
+
+        self.save_traces_var = tk.BooleanVar(value=False)
+        self.counts_var      = tk.IntVar(value=0)
+        self.triggers_var    = tk.IntVar(value=0)
+
+        self.time_log_path  = None
+        self.trace_csv_path = None
 
         self._build(parent)
         parent.after(500, self._update_loop)
@@ -707,78 +956,89 @@ class HistogramTab:
         sidebar_container, frame, _ = make_scrollable_sidebar(parent)
         sidebar_container.pack(side=tk.LEFT, fill="y")
 
-        def add_row(label, var):
-            tk.Label(frame, text=label).pack(anchor="w")
-            tk.Entry(frame, textvariable=var).pack(fill="x", pady=2)
+        # Ch0
+        _section_label(frame, "── Channel 0 ──")
+        add_row(frame, "First trigger level (V)",  self.first_trigger_ch0_var)
+        add_row(frame, "Second trigger level (V)", self.trigger_ch0_var)
+        add_row(frame, "Expected pulses (1 or 2)", self.pulses_ch0_var)
+        add_row(frame, "Voltage range (V p-p)",    self.ch0_range_var)
+        add_row(frame, "Attenuation",              self.ch0_attenuation_var)
 
-        tk.Label(frame, text="── Channel 0 ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(4, 2))
-        add_row("Ch0 first trigger level (V)",  self.first_trigger_ch0_var)
-        add_row("Ch0 second trigger level (V)", self.trigger_ch0_var)
-        add_row("Ch0 expected pulse count",     self.pulses_ch0_var)
-
-        tk.Label(frame, text="── Channel 1 ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(8, 2))
-        tk.Checkbutton(frame, text="Use Channel 1", variable=self.use_ch1_var,
-                       command=self._toggle_ch1).pack(anchor="w")
+        # Ch1
+        _section_label(frame, "── Channel 1 ──")
+        _checkbutton(frame, "Use Channel 1", self.use_ch1_var,
+                     command=self._toggle_ch1).pack(anchor="w", pady=(2, 4))
         self.ch1_widgets = []
 
         def add_ch1_row(label, var):
-            lbl = tk.Label(frame, text=label)
+            lbl = tk.Label(frame, text=label, bg=C["bg"], fg=C["fg_dim"],
+                           font=("Helvetica", 8), anchor="w")
             lbl.pack(anchor="w")
-            ent = tk.Entry(frame, textvariable=var)
-            ent.pack(fill="x", pady=2)
+            ent = _entry(frame, var)
             self.ch1_widgets += [lbl, ent]
 
-        add_ch1_row("Ch1 first trigger level (V)",  self.first_trigger_ch1_var)
-        add_ch1_row("Ch1 second trigger level (V)", self.trigger_ch1_var)
-        add_ch1_row("Ch1 expected pulse count",     self.pulses_ch1_var)
+        add_ch1_row("First trigger level (V)",  self.first_trigger_ch1_var)
+        add_ch1_row("Second trigger level (V)", self.trigger_ch1_var)
+        add_ch1_row("Expected pulses (1 or 2)", self.pulses_ch1_var)
+        add_ch1_row("Voltage range (V p-p)",    self.ch1_range_var)
+        add_ch1_row("Attenuation",              self.ch1_attenuation_var)
 
-        tk.Label(frame, text="── Shared ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(8, 2))
-        add_row("Sampling frequency (Hz)",       self.fs_var)
-        add_row("Low-pass cutoff (Hz)",          self.filter_var)
-        add_row("Start time after trigger (µs)", self.start_us_var)
-        add_row("Stop time after trigger (µs)",  self.stop_us_var)
-        add_row("Histogram bins",                self.bins_var)
-        add_row("Holdoff (µs)",                  self.holdoff_us_var)
+        # Acquisition / shared
+        _section_label(frame, "── Acquisition ──")
+        add_row(frame, "Sample rate (Hz)",            self.fs_var)
+        add_row(frame, "Low-pass cutoff (Hz)",        self.filter_var)
+        add_row(frame, "Window start after trig (µs)",self.start_us_var)
+        add_row(frame, "Window stop after trig (µs)", self.stop_us_var)
+        add_row(frame, "Histogram bins",              self.bins_var)
+        add_row(frame, "Holdoff (µs)",                self.holdoff_us_var)
 
-        tk.Button(frame, text="Reset",      command=self._reset).pack(fill="x", pady=4)
-        tk.Button(frame, text="Export CSV", command=self._export_csv).pack(fill="x", pady=2)
+        bf = tk.Frame(frame, bg=C["bg"])
+        bf.pack(fill="x", pady=(8, 4))
+        _button(bf, "Reset",      self._reset,      width=9).pack(side=tk.LEFT, padx=2)
+        _button(bf, "Export CSV", self._export_csv, width=9).pack(side=tk.LEFT, padx=2)
 
-        # Peak-data log
-        tk.Label(frame, text="── Data Saving ──",
-                 font=("", 9, "bold")).pack(anchor="w", pady=(10, 2))
-
-        tk.Button(frame, text="Set peak-data log path",
-                  command=self._set_log_path).pack(fill="x", pady=2)
+        # Data saving
+        _section_label(frame, "── Data Saving ──")
+        _button(frame, "Set peak-data log path",
+                self._set_log_path).pack(fill="x", pady=2)
         self.log_label = tk.Label(frame, text="(no log file set)",
-                                  wraplength=230, fg="gray",
-                                  justify="left", font=("", 8))
+                                  bg=C["bg"], fg=C["fg_dim"],
+                                  wraplength=230, justify="left",
+                                  font=("Helvetica", 8))
         self.log_label.pack(anchor="w")
 
-        tk.Checkbutton(frame, text="Save raw traces to CSV",
-                       variable=self.save_traces_var,
-                       command=self._toggle_save_traces).pack(anchor="w", pady=(6, 0))
+        _checkbutton(frame, "Save raw traces to CSV",
+                     self.save_traces_var,
+                     command=self._toggle_save_traces).pack(anchor="w", pady=(6, 0))
         self.trace_path_label = tk.Label(frame, text="(traces not saved)",
-                                         wraplength=230, fg="gray",
-                                         justify="left", font=("", 8))
+                                         bg=C["bg"], fg=C["fg_dim"],
+                                         wraplength=230, justify="left",
+                                         font=("Helvetica", 8))
         self.trace_path_label.pack(anchor="w")
 
-        # ADS panel — NOTE: histogram tab shares the same acq object but gets
-        # its own AdsPanel UI; only the last "Start" pressed takes effect.
-        self.ads_panel = AdsPanel(frame, self.acq, self.use_ch1_var)
+        # ADS hardware
+        self.ads_panel = AdsPanel(
+            frame, self.acq, self.use_ch1_var,
+            self.first_trigger_ch0_var, self.first_trigger_ch1_var,
+            self.ch0_range_var, self.ch1_range_var,
+            self.ch0_attenuation_var, self.ch1_attenuation_var,
+        )
 
-        tk.Label(frame, text="Counts (events read):").pack(anchor="w", pady=(10, 0))
-        tk.Label(frame, textvariable=self.counts_var).pack(anchor="w")
-        tk.Label(frame, text="Triggers (passing events):").pack(anchor="w", pady=(6, 0))
-        tk.Label(frame, textvariable=self.triggers_var).pack(anchor="w")
+        # Status counters
+        _section_label(frame, "── Status ──")
+        _counter_label(frame, "Events read:")
+        _counter_value(frame, self.counts_var)
+        _counter_label(frame, "Passing triggers:")
+        _counter_value(frame, self.triggers_var)
 
         self._toggle_ch1()
         self._build_plot(parent)
 
     def _build_plot(self, parent):
+        plot_frame = tk.Frame(parent, bg=C["plot_bg"])
+        plot_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         self.fig = plt.Figure(figsize=(10, 7))
+        _style_figure(self.fig)
         gs = gridspec.GridSpec(2, 4, figure=self.fig,
                                height_ratios=[1.7, 1],
                                hspace=0.6, wspace=0.5)
@@ -788,23 +1048,22 @@ class HistogramTab:
         self.ax_a2    = self.fig.add_subplot(gs[1, 2])
         self.ax_fwhm2 = self.fig.add_subplot(gs[1, 3])
         self._label_axes()
-        self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
-        self.canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _label_axes(self):
-        self.ax_dt.set_xlabel("Time after first trigger (µs)")
-        self.ax_dt.set_ylabel("Count")
-        self.ax_dt.set_title("dt — time to second pulse")
+        _style_ax(self.ax_dt,
+                  title="dt — time to second pulse",
+                  xlabel="Time after first trigger (µs)",
+                  ylabel="Count")
         for ax, title, xlabel in [
             (self.ax_a1,    "Pulse 1 height", "Amplitude (V)"),
             (self.ax_fwhm1, "Pulse 1 FWHM",   "FWHM (µs)"),
             (self.ax_a2,    "Pulse 2 height", "Amplitude (V)"),
             (self.ax_fwhm2, "Pulse 2 FWHM",   "FWHM (µs)"),
         ]:
-            ax.set_title(title, fontsize=8)
-            ax.set_xlabel(xlabel, fontsize=7)
-            ax.set_ylabel("Count", fontsize=7)
-            ax.tick_params(labelsize=6)
+            _style_ax(ax, title=title, xlabel=xlabel, ylabel="Count",
+                      title_size=8, label_size=7, tick_size=6)
 
     def _toggle_ch1(self):
         state = "normal" if self.use_ch1_var.get() else "disabled"
@@ -819,10 +1078,18 @@ class HistogramTab:
         )
         if path:
             self.time_log_path = path
-            self.log_label.config(text=os.path.basename(path), fg="darkgreen")
+            self.log_label.config(text=os.path.basename(path), fg=C["teal"])
 
     def _toggle_save_traces(self):
         if self.save_traces_var.get():
+            if not messagebox.askokcancel(
+                "Memory warning",
+                "Saving raw traces can consume many GB of disk space during "
+                "long runs.\n\nProceed and choose a file?",
+                icon="warning"
+            ):
+                self.save_traces_var.set(False)
+                return
             path = filedialog.asksaveasfilename(
                 title="Save traces CSV",
                 defaultextension=".csv",
@@ -830,13 +1097,15 @@ class HistogramTab:
             )
             if path:
                 self.trace_csv_path = path
-                self.trace_path_label.config(text=os.path.basename(path), fg="darkgreen")
+                self.trace_path_label.config(text=os.path.basename(path),
+                                             fg=C["teal"])
             else:
                 self.save_traces_var.set(False)
-                self.trace_path_label.config(text="(traces not saved)", fg="gray")
+                self.trace_path_label.config(text="(traces not saved)",
+                                             fg=C["fg_dim"])
         else:
             self.trace_csv_path = None
-            self.trace_path_label.config(text="(traces not saved)", fg="gray")
+            self.trace_path_label.config(text="(traces not saved)", fg=C["fg_dim"])
 
     def _reset(self):
         self.records.clear()
@@ -875,13 +1144,11 @@ class HistogramTab:
         batch = []
         for _ in range(50):
             try:
-                item = self.acq.queue.get_nowait()
-                batch.append(item)
+                batch.append(self.acq.queue.get_nowait())
             except queue.Empty:
                 break
-        if not batch:
-            return
-        self._process_batch(batch)
+        if batch:
+            self._process_batch(batch)
 
     def _process_batch(self, batch):
         fs              = self.fs_var.get()
@@ -900,6 +1167,7 @@ class HistogramTab:
 
         nyq       = fs / 2.0
         do_filter = 0 < fc < nyq
+        b = a_coef = None
         if do_filter:
             b, a_coef = sig.butter(4, fc / nyq, btype="low")
 
@@ -910,47 +1178,48 @@ class HistogramTab:
             raw_ch0 = item["ch0"]
             self.total_counts += 1
 
-            cross_ch0 = find_first_trigger_index(raw_ch0, first_trig_ch0)
-            if cross_ch0 is None:
-                continue
-            chopped_ch0 = raw_ch0[cross_ch0:]
-            if stop_idx > len(chopped_ch0):
-                continue
-
-            win1_ch0  = chopped_ch0[:start_idx]
-            filt1_ch0 = (sig.filtfilt(b, a_coef, win1_ch0)
-                         if (do_filter and len(win1_ch0) > 9)
-                         else win1_ch0.copy())
-            a1, fwhm1_us = measure_pulse(filt1_ch0, fs, half_width_only=True)
-
-            win2_ch0  = chopped_ch0[start_idx:stop_idx]
-            filt2_ch0 = (sig.filtfilt(b, a_coef, win2_ch0)
-                         if do_filter else win2_ch0.copy())
-
-            if count_pulses(filt2_ch0, trig_ch0, holdoff_samples) != pulses_ch0:
+            ok_ch0, cross_ch0 = passes_trigger_logic(
+                raw_ch0, fs, first_trig_ch0, trig_ch0, pulses_ch0,
+                start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef
+            )
+            if not ok_ch0:
                 continue
 
             if use_ch1 and item["ch1"] is not None:
-                raw_ch1   = item["ch1"]
-                cross_ch1 = find_first_trigger_index(raw_ch1, first_trig_ch1)
-                if cross_ch1 is None:
-                    continue
-                chopped_ch1 = raw_ch1[cross_ch1:]
-                if stop_idx > len(chopped_ch1):
-                    continue
-                win_ch1  = chopped_ch1[start_idx:stop_idx]
-                filt_ch1 = (sig.filtfilt(b, a_coef, win_ch1)
-                            if do_filter else win_ch1.copy())
-                if count_pulses(filt_ch1, trig_ch1, holdoff_samples) != pulses_ch1:
+                ok_ch1, _ = passes_trigger_logic(
+                    item["ch1"], fs, first_trig_ch1, trig_ch1, pulses_ch1,
+                    start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef
+                )
+                if not ok_ch1:
                     continue
 
-            above2  = filt2_ch0 >= trig_ch0
-            rising2 = np.where(~above2[:-1] & above2[1:])[0] + 1
-            if len(rising2) == 0:
-                continue
-            dt_us = (rising2[0] + start_idx) / fs * 1e6
+            # ---- Pulse measurements (on chopped signal from first trigger) ----
+            chopped_ch0 = raw_ch0[cross_ch0:]
 
-            a2, fwhm2_us = measure_pulse(filt2_ch0, fs)
+            # Pulse 1: region from first trigger up to start_idx
+            win1      = chopped_ch0[:start_idx]
+            filt1     = (sig.filtfilt(b, a_coef, win1)
+                         if (do_filter and len(win1) > 9) else win1.copy())
+            a1, fwhm1_us = measure_pulse(filt1, fs, half_width_only=True)
+
+            # Pulse 2: analysis window [start_idx, stop_idx)
+            if stop_idx <= len(chopped_ch0):
+                win2  = chopped_ch0[start_idx:stop_idx]
+                filt2 = (sig.filtfilt(b, a_coef, win2)
+                         if do_filter else win2.copy())
+            else:
+                filt2 = np.array([])
+
+            # dt: time of second pulse rising edge from first trigger
+            dt_us = np.nan
+            a2    = np.nan
+            fwhm2_us = np.nan
+            if len(filt2):
+                above2  = filt2 >= trig_ch0
+                rising2 = np.where(~above2[:-1] & above2[1:])[0] + 1
+                if len(rising2):
+                    dt_us = (rising2[0] + start_idx) / fs * 1e6
+                a2, fwhm2_us = measure_pulse(filt2, fs)
 
             ts = datetime.datetime.now().isoformat(timespec="seconds")
             new_records.append({
@@ -963,18 +1232,16 @@ class HistogramTab:
             })
 
             if self.save_traces_var.get():
-                trace_rows.append(chopped_ch0[:stop_idx].tolist())
+                trace_rows.append(raw_ch0.tolist())
                 if use_ch1 and item["ch1"] is not None:
-                    trace_rows.append(item["ch1"][cross_ch1:][:stop_idx].tolist())
+                    trace_rows.append(item["ch1"].tolist())
 
         self.counts_var.set(self.total_counts)
-
         if not new_records:
             return
 
         self.records.extend(new_records)
         self.triggers_var.set(len(self.records))
-
         self._save_records(new_records)
 
         if self.save_traces_var.get() and trace_rows and self.trace_csv_path:
@@ -1010,23 +1277,26 @@ class HistogramTab:
 
         def _hist(ax, data, title, xlabel, color):
             ax.clear()
+            _style_ax(ax, title=title, xlabel=xlabel, ylabel="Count",
+                      title_size=8, label_size=7, tick_size=6)
             clean = data.dropna()
             if len(clean):
-                ax.hist(clean, bins=bins, color=color, edgecolor="black", linewidth=0.5)
-            ax.set_title(title, fontsize=8)
-            ax.set_xlabel(xlabel, fontsize=7)
-            ax.set_ylabel("Count", fontsize=7)
-            ax.tick_params(labelsize=6)
+                ax.hist(clean, bins=bins, color=color,
+                        edgecolor=C["plot_bg"], linewidth=0.5)
 
-        _hist(self.ax_dt,    df["dt_us"],     "dt — time to second pulse",
-              "Time after first trigger (µs)", "steelblue")
-        _hist(self.ax_a1,    df["a1"],        "Pulse 1 height", "Amplitude (V)", "mediumseagreen")
-        _hist(self.ax_fwhm1, df["fwhm1_us"],  "Pulse 1 FWHM",   "FWHM (µs)",    "mediumseagreen")
-        _hist(self.ax_a2,    df["a2"],        "Pulse 2 height", "Amplitude (V)", "tomato")
-        _hist(self.ax_fwhm2, df["fwhm2_us"],  "Pulse 2 FWHM",   "FWHM (µs)",    "tomato")
+        _hist(self.ax_dt,    df["dt_us"],    "dt — time to second pulse",
+              "Time after first trigger (µs)", C["hist_dt"])
+        _hist(self.ax_a1,    df["a1"],       "Pulse 1 height",
+              "Amplitude (V)", C["hist_p1"])
+        _hist(self.ax_fwhm1, df["fwhm1_us"], "Pulse 1 FWHM",
+              "FWHM (µs)",    C["hist_p1"])
+        _hist(self.ax_a2,    df["a2"],       "Pulse 2 height",
+              "Amplitude (V)", C["hist_p2"])
+        _hist(self.ax_fwhm2, df["fwhm2_us"], "Pulse 2 FWHM",
+              "FWHM (µs)",    C["hist_p2"])
 
-        self.fig.subplots_adjust(left=0.07, right=0.97, top=0.93, bottom=0.1,
-                                 hspace=0.65, wspace=0.5)
+        self.fig.subplots_adjust(left=0.07, right=0.97, top=0.93,
+                                 bottom=0.1, hspace=0.65, wspace=0.5)
         self.canvas.draw()
 
 
@@ -1037,20 +1307,20 @@ class HistogramTab:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Muon Detector")
+        root.title("Muon Detector DAQ")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Shared acquisition manager
+        _apply_global_theme(root)
+
         self.acq = AcquisitionManager()
 
-        # Notebook
         nb = ttk.Notebook(root)
         nb.pack(fill=tk.BOTH, expand=True)
 
-        tab1 = tk.Frame(nb)
-        tab2 = tk.Frame(nb)
-        nb.add(tab1, text="Signal Viewer")
-        nb.add(tab2, text="Live Histogram")
+        tab1 = tk.Frame(nb, bg=C["bg"])
+        tab2 = tk.Frame(nb, bg=C["bg"])
+        nb.add(tab1, text="  Signal Viewer  ")
+        nb.add(tab2, text="  Live Histogram  ")
 
         self.viewer    = SignalViewerTab(tab1, self.acq)
         self.histogram = HistogramTab(tab2, self.acq)

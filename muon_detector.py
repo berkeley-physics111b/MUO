@@ -916,7 +916,7 @@ class HistogramTab:
 
         self.first_trigger_ch0_var = tk.DoubleVar(value=0.2)
         self.trigger_ch0_var       = tk.DoubleVar(value=0.01)
-        self.pulses_ch0_var        = tk.IntVar(value=1)
+        self.pulses_ch0_var        = tk.IntVar(value=2)
         self.ch0_range_var         = tk.DoubleVar(value=5.0)
         self.ch0_attenuation_var   = tk.DoubleVar(value=1.0)
 

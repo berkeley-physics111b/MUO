@@ -1745,8 +1745,8 @@ class HistogramTab:
 
         if save_all:
             lines.append(
-                "# passes_all=1 → passed all triggers; "
-                "passes_all=0 → passed first trigger only"
+                "# passes_all=1 : passed all triggers; "
+                "passes_all=0 : passed first trigger only"
             )
         lines.append("#")
         return "\n".join(lines) + "\n"

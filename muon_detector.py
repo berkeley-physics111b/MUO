@@ -480,7 +480,7 @@ def subtract_pretrigger_offset(raw, cross_idx, fs):
 
 def analyse_channel(raw, fs, first_trig, second_trig, expected_pulses,
                     start_idx, stop_idx, holdoff_samples,
-                    do_filter, b=None, a_coef=None):
+                    do_filter, sos=None):
     """
     Returns (passes_first, passes_second, cross_idx, t1_us, t2_us, dt_us,
              a1, fwhm1_us, a2, fwhm2_us, offset_corrected, filtered).
@@ -488,7 +488,7 @@ def analyse_channel(raw, fs, first_trig, second_trig, expected_pulses,
     Processing order:
       1. Find trigger crossing on raw trace.
       2. Subtract pretrigger baseline (offset correction).
-      3. Apply filter.
+      3. Apply filter (sosfiltfilt for numerical stability).
       4. Extract amplitude/width from filtered trace.
 
     cross_idx  : buffer-absolute index of first trigger crossing (or None)
@@ -515,9 +515,10 @@ def analyse_channel(raw, fs, first_trig, second_trig, expected_pulses,
     # Step 2: offset correction
     offset_corrected = subtract_pretrigger_offset(raw, cross, fs)
 
-    # Step 3: apply filter to full offset-corrected trace
-    if do_filter and len(offset_corrected) > 9:
-        filtered = sig.filtfilt(b, a_coef, offset_corrected)
+    # Step 3: apply filter to full offset-corrected trace (sosfiltfilt is
+    # numerically more stable and faster than direct-form filtfilt)
+    if do_filter and sos is not None and len(offset_corrected) > 9:
+        filtered = sig.sosfiltfilt(sos, offset_corrected)
     else:
         filtered = offset_corrected.copy()
 
@@ -559,9 +560,99 @@ def analyse_channel(raw, fs, first_trig, second_trig, expected_pulses,
             offset_corrected, filtered)
 
 
+
 # ===========================================================================
-# ADS / Acquisition panel
+# Processing thread  (change 1 & 6: background processing, unbounded drain)
 # ===========================================================================
+
+class ProcessingThread:
+    """
+    Reads raw waveforms from acq.queue, performs all numpy/scipy work in a
+    background thread, and pushes finished result dicts into results_queue.
+    The GUI only reads results_queue for plotting / histogramming.
+
+    Change 2: filter coefficients (sos) are pre-computed once and only
+    recomputed when fs or fc change (dirty flag).
+    Change 6: the queue is drained completely on every processing cycle —
+    no 50-item cap.
+    """
+
+    def __init__(self, acq: "AcquisitionManager", process_fn):
+        """
+        acq         : AcquisitionManager whose .queue supplies raw items
+        process_fn  : callable(batch, sos, do_filter) -> list of result dicts
+        """
+        self.acq         = acq
+        self.process_fn  = process_fn
+        self.results_queue = queue.Queue(maxsize=10000)
+
+        self._thread     = None
+        self._stop_event = threading.Event()
+
+        # Filter cache (change 2)
+        self._cached_fs  = None
+        self._cached_fc  = None
+        self._sos        = None
+        self._do_filter  = False
+
+        # Callbacks so the processing thread can read current settings
+        # without touching Tkinter vars (set by owner before starting)
+        self.get_fs = lambda: 100e6
+        self.get_fc = lambda: 100e6
+
+    def _refresh_filter(self):
+        """Recompute sos only when fs or fc has changed (change 2)."""
+        fs = self.get_fs()
+        fc = self.get_fc()
+        if fs == self._cached_fs and fc == self._cached_fc:
+            return
+        self._cached_fs = fs
+        self._cached_fc = fc
+        nyq = fs / 2.0
+        self._do_filter = 0 < fc < nyq
+        if self._do_filter:
+            self._sos = sig.butter(4, fc / nyq, btype="low", output="sos")
+        else:
+            self._sos = None
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    @property
+    def is_running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def _loop(self):
+        while not self._stop_event.is_set():
+            # Change 6: drain the entire queue in one shot — no item cap
+            batch = []
+            while True:
+                try:
+                    batch.append(self.acq.queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            if batch:
+                self._refresh_filter()
+                results = self.process_fn(batch, self._sos, self._do_filter,
+                                          self._cached_fs)
+                for r in results:
+                    try:
+                        self.results_queue.put_nowait(r)
+                    except queue.Full:
+                        pass  # drop oldest-ish; GUI can't keep up
+            else:
+                time.sleep(0.01)  # idle wait — avoid busy spin
+
+
 
 class AdsPanel:
     def __init__(self, frame, acq: AcquisitionManager,
@@ -638,9 +729,16 @@ class SignalViewerTab:
         self.acq     = acq
         self.running = True
 
+        # Change 8: only keep the last N traces (N = max_display_var).
+        # We use a collections.deque with maxlen; it is updated whenever
+        # max_display_var changes.
+        import collections
+        self._collections = collections
+
         # stored as (raw_trim, offset_trim, filt_trim, cross_in_trim) tuples
-        self.stored_ch0 = []
-        self.stored_ch1 = []
+        # Change 8: deques with bounded length — no unbounded list growth
+        self.stored_ch0 = collections.deque()
+        self.stored_ch1 = collections.deque()
         self.first_trigger_count = 0
         self.passing_count       = 0
 
@@ -666,14 +764,25 @@ class SignalViewerTab:
         self.holdoff_us_var  = tk.DoubleVar(value=0.5)
         self.max_display_var = tk.IntVar(value=50)
 
-        self.save_traces_var      = tk.BooleanVar(value=False)
+        # Change 8: trace of raw waveforms to CSV removed; no save_traces_var
         self.first_trigger_count_var = tk.IntVar(value=0)
         self.passing_var             = tk.IntVar(value=0)
 
-        self.trace_csv_path = None
+        # Change 5: decoupled redraw timer (1 s)
+        self._plot_dirty   = False
+        self._last_start_idx = 0
 
         self._build(parent)
-        parent.after(500, self._update_loop)
+
+        # Change 1: start ProcessingThread
+        self._proc_thread = ProcessingThread(self.acq, self._processing_fn)
+        self._proc_thread.get_fs = lambda: self.ads_panel.sample_rate_var.get()
+        self._proc_thread.get_fc = lambda: self.filter_var.get()
+        self._proc_thread.start()
+
+        # Change 5: fast results-drain (100 ms), slow redraw (1000 ms)
+        parent.after(100,  self._drain_results)
+        parent.after(1000, self._redraw_timer)
 
     def _build(self, parent):
         sidebar_container, frame, _ = make_scrollable_sidebar(parent)
@@ -710,16 +819,9 @@ class SignalViewerTab:
         add_row(frame, "Window stop after trig (µs)",  self.stop_us_var)
         add_row(frame, "Holdoff (µs)",                 self.holdoff_us_var)
         add_row(frame, "Max traces to display",        self.max_display_var)
-
-        _section_label(frame, "── Data Saving ──")
-        _checkbutton(frame, "Save raw traces to CSV",
-                     self.save_traces_var,
-                     command=self._toggle_save_traces).pack(anchor="w")
-        self.trace_path_label = tk.Label(frame, text="(traces not saved)",
-                                         bg=C["bg"], fg=C["fg_dim"],
-                                         wraplength=240, justify="left",
-                                         font=("Helvetica", 8))
-        self.trace_path_label.pack(anchor="w")
+        # Change 8: resize deques when the user changes max_display
+        self.max_display_var.trace_add("write", self._on_max_display_change)
+        # Change 8: raw-trace CSV saving removed from Signal Viewer
 
         self.ads_panel = AdsPanel(
             frame, self.acq, self.use_ch1_var,
@@ -771,32 +873,16 @@ class SignalViewerTab:
         if hasattr(self, "fig"):
             self._rebuild_axes()
 
-    def _toggle_save_traces(self):
-        if self.save_traces_var.get():
-            if not messagebox.askokcancel(
-                "Memory warning",
-                "Saving raw traces can consume many GB of disk space during "
-                "long runs.\n\nProceed and choose a file?",
-                icon="warning"
-            ):
-                self.save_traces_var.set(False)
-                return
-            path = filedialog.asksaveasfilename(
-                title="Save traces CSV", defaultextension=".csv",
-                filetypes=[("CSV files", "*.csv")])
-            if path:
-                self.trace_csv_path = path
-                self.trace_path_label.config(text=os.path.basename(path), fg=C["teal"])
-            else:
-                self.save_traces_var.set(False)
-                self.trace_path_label.config(text="(traces not saved)", fg=C["fg_dim"])
-        else:
-            self.trace_csv_path = None
-            self.trace_path_label.config(text="(traces not saved)", fg=C["fg_dim"])
+    def _on_max_display_change(self, *_):
+        """Change 8: resize deques so they only hold max_display traces."""
+        n = max(1, self.max_display_var.get())
+        self.stored_ch0 = self._collections.deque(self.stored_ch0, maxlen=n)
+        self.stored_ch1 = self._collections.deque(self.stored_ch1, maxlen=n)
 
     def _clear_graphs(self):
-        self.stored_ch0.clear()
-        self.stored_ch1.clear()
+        n = max(1, self.max_display_var.get())
+        self.stored_ch0 = self._collections.deque(maxlen=n)
+        self.stored_ch1 = self._collections.deque(maxlen=n)
         self.first_trigger_count = 0
         self.passing_count       = 0
         self.first_trigger_count_var.set(0)
@@ -804,29 +890,15 @@ class SignalViewerTab:
         self._rebuild_axes()
 
     # ------------------------------------------------------------------ #
+    # Change 1: processing_fn runs inside ProcessingThread (background)   #
+    # ------------------------------------------------------------------ #
 
-    def _update_loop(self):
-        if not self.running:
-            return
-        self._drain_queue()
-        try:
-            self.fig.canvas.get_tk_widget().after(500, self._update_loop)
-        except Exception:
-            pass
-
-    def _drain_queue(self):
-        batch = []
-        for _ in range(50):
-            try:
-                batch.append(self.acq.queue.get_nowait())
-            except queue.Empty:
-                break
-        if batch:
-            self._process_batch(batch)
-
-    def _process_batch(self, batch):
-        fs              = self.ads_panel.sample_rate_var.get()
-        fc              = self.filter_var.get()
+    def _processing_fn(self, batch, sos, do_filter, fs):
+        """
+        Called from ProcessingThread — no Tkinter calls allowed here.
+        Returns a list of result dicts to be consumed by the GUI thread.
+        Change 4: uses sosfiltfilt via sos argument.
+        """
         start_idx       = int(self.start_us_var.get()  * 1e-6 * fs)
         stop_idx        = int(self.stop_us_var.get()   * 1e-6 * fs)
         holdoff_samples = int(self.holdoff_us_var.get() * 1e-6 * fs)
@@ -840,90 +912,116 @@ class SignalViewerTab:
         trig_ch1       = self.trigger_ch1_var.get()
         pulses_ch1     = self.pulses_ch1_var.get()
 
-        nyq       = fs / 2.0
-        do_filter = 0 < fc < nyq
-        b = a_coef = None
-        if do_filter:
-            b, a_coef = sig.butter(4, fc / nyq, btype="low")
-
-        new_ch0    = []
-        new_ch1    = []
-        trace_rows = []
+        results = []
 
         for item in batch:
             raw_ch0 = item["ch0"]
 
             (pass1_ch0, pass2_ch0, cross_ch0,
-             t1_ch0, t2_ch0, dt_ch0,
-             a1_ch0, fwhm1_ch0, a2_ch0, fwhm2_ch0,
+             t1_ch0, _, _,
+             _, _, _, _,
              offset_ch0, filtered_ch0) = analyse_channel(
                 raw_ch0, fs, first_trig_ch0, trig_ch0, pulses_ch0,
-                start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
+                start_idx, stop_idx, holdoff_samples, do_filter, sos)
 
             if not pass1_ch0:
                 continue
-            self.first_trigger_count += 1
+            first_trig_hits = 1   # counted per-item; aggregated in GUI
 
             if not pass2_ch0:
+                results.append({"type": "first_trig_only",
+                                 "count": first_trig_hits})
                 continue
 
+            ch1_tuple = None
             if use_ch1 and item["ch1"] is not None:
                 (pass1_ch1, pass2_ch1, cross_ch1,
-                 t1_ch1, t2_ch1, dt_ch1,
-                 a1_ch1, fwhm1_ch1, a2_ch1, fwhm2_ch1,
+                 _, _, _,
+                 _, _, _, _,
                  offset_ch1, filtered_ch1) = analyse_channel(
                     item["ch1"], fs, first_trig_ch1, trig_ch1, pulses_ch1,
-                    start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
+                    start_idx, stop_idx, holdoff_samples, do_filter, sos)
                 if not (pass1_ch1 and pass2_ch1):
+                    results.append({"type": "first_trig_only",
+                                     "count": first_trig_hits})
                     continue
 
                 trim_start_ch1 = max(0, cross_ch1 - pretrig_samples)
                 trim_end_ch1   = cross_ch1 + stop_idx
-                new_ch1.append((
+                ch1_tuple = (
                     item["ch1"][trim_start_ch1:trim_end_ch1],
                     offset_ch1[trim_start_ch1:trim_end_ch1],
                     filtered_ch1[trim_start_ch1:trim_end_ch1],
                     cross_ch1 - trim_start_ch1,
-                ))
-
-                if self.save_traces_var.get():
-                    trace_rows.append(item["ch1"].tolist())
+                )
 
             trim_start = max(0, cross_ch0 - pretrig_samples)
             trim_end   = cross_ch0 + stop_idx
-            new_ch0.append((
+            ch0_tuple = (
                 raw_ch0[trim_start:trim_end],
                 offset_ch0[trim_start:trim_end],
                 filtered_ch0[trim_start:trim_end],
                 cross_ch0 - trim_start,
-            ))
+            )
 
-            self.passing_count += 1
-            if self.save_traces_var.get():
-                trace_rows.append(raw_ch0.tolist())
+            results.append({
+                "type":       "passing",
+                "ch0":        ch0_tuple,
+                "ch1":        ch1_tuple,
+                "start_idx":  start_idx,
+                "first_trig_hits": first_trig_hits,
+            })
 
-        self.first_trigger_count_var.set(self.first_trigger_count)
+        return results
 
-        if not new_ch0:
+    # Change 5: GUI drains results fast but only redraws on a fixed timer
+    def _drain_results(self):
+        """GUI thread: drain results_queue, accumulate, mark dirty."""
+        if not self.running:
             return
-
-        self.stored_ch0.extend(new_ch0)
-        if use_ch1:
-            self.stored_ch1.extend(new_ch1)
-        self.passing_var.set(self.passing_count)
-
-        if self.save_traces_var.get() and trace_rows and self.trace_csv_path:
-            self._append_trace_csv(trace_rows)
-
-        self._update_plot(fs, start_idx)
-
-    def _append_trace_csv(self, rows):
         try:
-            write_header = not os.path.exists(self.trace_csv_path)
-            pd.DataFrame(rows).to_csv(
-                self.trace_csv_path, mode="a", header=write_header, index=False)
-        except Exception as e:
-            print(f"[SignalViewer] trace CSV write error: {e}")
+            changed = False
+            use_ch1 = self.use_ch1_var.get()
+            while True:
+                try:
+                    r = self._proc_thread.results_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if r["type"] == "first_trig_only":
+                    self.first_trigger_count += r["count"]
+                    changed = True
+                elif r["type"] == "passing":
+                    self.first_trigger_count += r["first_trig_hits"]
+                    self.stored_ch0.append(r["ch0"])
+                    if use_ch1 and r["ch1"] is not None:
+                        self.stored_ch1.append(r["ch1"])
+                    self.passing_count += 1
+                    self._last_start_idx = r["start_idx"]
+                    changed = True
+
+            if changed:
+                self.first_trigger_count_var.set(self.first_trigger_count)
+                self.passing_var.set(self.passing_count)
+                self._plot_dirty = True
+        except Exception:
+            pass
+        try:
+            self.fig.canvas.get_tk_widget().after(100, self._drain_results)
+        except Exception:
+            pass
+
+    def _redraw_timer(self):
+        """Change 5: redraw at most once per second."""
+        if not self.running:
+            return
+        if self._plot_dirty and self.stored_ch0:
+            self._update_plot(self.ads_panel.sample_rate_var.get(),
+                              self._last_start_idx)
+            self._plot_dirty = False
+        try:
+            self.fig.canvas.get_tk_widget().after(1000, self._redraw_timer)
+        except Exception:
+            pass
 
     def _update_plot(self, fs, start_idx):
         use_ch1     = self.use_ch1_var.get()
@@ -937,9 +1035,9 @@ class SignalViewerTab:
                           color_raw, color_off, color_filt, title):
             ax.clear()
             _style_ax(ax, title=title, ylabel="Amplitude (V)")
-            recent = stored[-max_display:]
-            for idx, (raw_tr, off_tr, filt_tr, cross_in) in enumerate(recent):
-                t_us = (np.arange(len(raw_tr)) - cross_in) / fs * 1e6
+            # Change 8: stored is already a deque(maxlen=max_display)
+            for idx, (raw_tr, off_tr, filt_tr, cross_in) in enumerate(stored):
+                t_us  = (np.arange(len(raw_tr)) - cross_in) / fs * 1e6
                 alpha = 0.3
                 if idx == 0:
                     ax.plot(t_us, raw_tr,  color=color_raw,  alpha=alpha,
@@ -964,7 +1062,7 @@ class SignalViewerTab:
         _plot_channel(self.ax0, self.stored_ch0,
                       first_trig_ch0, trig_ch0,
                       C["trace_raw"], C["trace_offset"], C["trace_ch0"],
-                      f"Ch0 — last {min(len(self.stored_ch0), max_display)} traces")
+                      f"Ch0 — last {len(self.stored_ch0)} traces")
 
         if use_ch1 and self.ax1 is not None and self.stored_ch1:
             first_trig_ch1 = self.first_trigger_ch1_var.get()
@@ -972,7 +1070,7 @@ class SignalViewerTab:
             _plot_channel(self.ax1, self.stored_ch1,
                           first_trig_ch1, trig_ch1,
                           C["trace_ch1_raw"], C["trace_ch1_offset"], C["trace_ch1"],
-                          f"Ch1 — last {min(len(self.stored_ch1), max_display)} traces")
+                          f"Ch1 — last {len(self.stored_ch1)} traces")
             self.ax1.set_xlabel("Time relative to first trigger (µs)")
         else:
             self.ax0.set_xlabel("Time relative to first trigger (µs)")
@@ -997,6 +1095,19 @@ class HistogramTab:
         self.passing_count       = 0
         self._run_start_time     = None    # datetime when acquisition started
         self._count_times        = []      # list of datetime for each passing event
+
+        # Change 7: accumulate rows in memory; flush to disk every N records
+        # or every T seconds rather than on every batch.
+        self._pending_records     = []     # unflushed fully-passing rows
+        self._pending_all_charged = []     # unflushed all-charged rows
+        self._pending_traces      = []     # unflushed trace rows
+        self._last_flush_time     = time.monotonic()
+        self._FLUSH_INTERVAL_S    = 5.0    # flush at most every 5 s
+        self._FLUSH_N_RECORDS     = 200    # … or every 200 records
+        self._header_written      = False
+
+        # Change 5: decouple processing from plotting
+        self._plot_dirty = False
 
         # ---- Tk vars ----
         self.use_ch1_var           = tk.BooleanVar(value=False)
@@ -1031,7 +1142,16 @@ class HistogramTab:
         self._hist_axes = {}
 
         self._build(parent)
-        parent.after(500, self._update_loop)
+
+        # Change 1: start ProcessingThread
+        self._proc_thread = ProcessingThread(self.acq, self._processing_fn)
+        self._proc_thread.get_fs = lambda: self.ads_panel.sample_rate_var.get()
+        self._proc_thread.get_fc = lambda: self.filter_var.get()
+        self._proc_thread.start()
+
+        # Change 5: fast results-drain (100 ms), slow redraw (1500 ms)
+        parent.after(100,  self._drain_results)
+        parent.after(1500, self._redraw_timer)
 
     def _build(self, parent):
         sidebar_container, frame, _ = make_scrollable_sidebar(parent)
@@ -1275,12 +1395,18 @@ class HistogramTab:
         self.records.clear()
         self.all_charged_records.clear()
         self._count_times.clear()
-        self._run_start_time = None
+        self._run_start_time  = None
         self.first_trigger_count = 0
         self.passing_count       = 0
         self.first_trigger_count_var.set(0)
         self.passing_var.set(0)
         self.count_rate_var.set("Rate: — Hz")
+        # Change 7: discard any pending (unwritten) data
+        self._pending_records.clear()
+        self._pending_all_charged.clear()
+        self._pending_traces.clear()
+        self._header_written  = False
+        self._plot_dirty      = False
         self._rebuild_hist_axes()
 
     def _reset(self):
@@ -1298,29 +1424,15 @@ class HistogramTab:
             pd.DataFrame(src).to_csv(path, index=False)
 
     # ------------------------------------------------------------------
+    # Change 1: processing_fn runs inside ProcessingThread (background)
+    # ------------------------------------------------------------------
 
-    def _update_loop(self):
-        if not self.running:
-            return
-        self._drain_queue()
-        try:
-            self.fig.canvas.get_tk_widget().after(500, self._update_loop)
-        except Exception:
-            pass
-
-    def _drain_queue(self):
-        batch = []
-        for _ in range(50):
-            try:
-                batch.append(self.acq.queue.get_nowait())
-            except queue.Empty:
-                break
-        if batch:
-            self._process_batch(batch)
-
-    def _process_batch(self, batch):
-        fs              = self.ads_panel.sample_rate_var.get()
-        fc              = self.filter_var.get()
+    def _processing_fn(self, batch, sos, do_filter, fs):
+        """
+        Called from ProcessingThread — no Tkinter calls allowed here.
+        Change 4: uses sosfiltfilt via sos argument.
+        Returns a list of result dicts consumed by the GUI thread.
+        """
         start_idx       = int(self.start_us_var.get()  * 1e-6 * fs)
         stop_idx        = int(self.stop_us_var.get()   * 1e-6 * fs)
         holdoff_samples = int(self.holdoff_us_var.get() * 1e-6 * fs)
@@ -1335,54 +1447,57 @@ class HistogramTab:
         save_all       = self.save_all_charged_var.get()
         trig_ch        = self.ads_panel.trigger_ch_var.get()
 
-        nyq       = fs / 2.0
-        do_filter = 0 < fc < nyq
-        b = a_coef = None
-        if do_filter:
-            b, a_coef = sig.butter(4, fc / nyq, btype="low")
-
-        new_records      = []
-        new_all_charged  = []
-        trace_rows       = []
+        results = []
 
         for item in batch:
-            raw_ch0   = item["ch0"]
-            item_ts   = item.get("timestamp", datetime.datetime.now())
-
-            if self._run_start_time is None:
-                self._run_start_time = item_ts
+            raw_ch0  = item["ch0"]
+            item_ts  = item.get("timestamp", datetime.datetime.now())
 
             (pass1_ch0, pass2_ch0, cross_ch0,
              t1_ch0, t2_ch0, dt_ch0,
              a1_ch0, fwhm1_ch0, a2_ch0, fwhm2_ch0,
              offset_ch0, filtered_ch0) = analyse_channel(
                 raw_ch0, fs, first_trig_ch0, trig_ch0, pulses_ch0,
-                start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
+                start_idx, stop_idx, holdoff_samples, do_filter, sos)
 
             if not pass1_ch0:
                 continue
-            self.first_trigger_count += 1
 
             ts_str = item_ts.isoformat(timespec="milliseconds")
 
-            # If save_all_charged: record first-trigger events that fail full selection
-            if save_all and not pass2_ch0:
-                new_all_charged.append({
-                    "timestamp":  ts_str,
-                    "passes_all": 0,
-                    "t1_trig":    t1_ch0,
-                    "a1_trig":    a1_ch0,
-                    "fwhm1_trig": fwhm1_ch0,
-                })
-                continue
-
             if not pass2_ch0:
+                if save_all:
+                    # Full ch0 data even for first-trig-only events
+                    results.append({
+                        "type":       "first_trig_only",
+                        "timestamp":  item_ts,
+                        "ts_str":     ts_str,
+                        "t1_ch0":     t1_ch0,
+                        "t2_ch0":     np.nan,
+                        "dt_ch0":     np.nan,
+                        "a1_ch0":     a1_ch0,
+                        "fwhm1_ch0":  fwhm1_ch0,
+                        "a2_ch0":     np.nan,
+                        "fwhm2_ch0":  np.nan,
+                        "t1_ch1":     np.nan,
+                        "t2_ch1":     np.nan,
+                        "dt_ch1":     np.nan,
+                        "a1_ch1":     np.nan,
+                        "fwhm1_ch1":  np.nan,
+                        "a2_ch1":     np.nan,
+                        "fwhm2_ch1":  np.nan,
+                        "dt_inter":   np.nan,
+                        "raw_ch0":    raw_ch0 if self.save_traces_var.get() else None,
+                    })
+                else:
+                    results.append({"type": "first_trig_count"})
                 continue
 
             # Ch1
             t1_ch1 = t2_ch1 = dt_ch1 = np.nan
             a1_ch1 = fwhm1_ch1 = a2_ch1 = fwhm2_ch1 = np.nan
             dt_inter = np.nan
+            raw_ch1_data = None
 
             if use_ch1 and item["ch1"] is not None:
                 (pass1_ch1, pass2_ch1, cross_ch1,
@@ -1390,31 +1505,44 @@ class HistogramTab:
                  a1_ch1, fwhm1_ch1, a2_ch1, fwhm2_ch1,
                  offset_ch1, filtered_ch1) = analyse_channel(
                     item["ch1"], fs, first_trig_ch1, trig_ch1, pulses_ch1,
-                    start_idx, stop_idx, holdoff_samples, do_filter, b, a_coef)
-
-                if save_all and not (pass1_ch1 and pass2_ch1):
-                    # Passed ch0 but not ch1 — record as failing full selection
-                    new_all_charged.append({
-                        "timestamp":  ts_str,
-                        "passes_all": 0,
-                        "t1_trig":    t1_ch0,
-                        "a1_trig":    a1_ch0,
-                        "fwhm1_trig": fwhm1_ch0,
-                    })
-                    continue
+                    start_idx, stop_idx, holdoff_samples, do_filter, sos)
+                raw_ch1_data = item["ch1"]
 
                 if not (pass1_ch1 and pass2_ch1):
+                    if save_all:
+                        # ch0 passed both triggers; ch1 failed — record with full ch0 data
+                        results.append({
+                            "type":       "first_trig_only",
+                            "timestamp":  item_ts,
+                            "ts_str":     ts_str,
+                            "t1_ch0":     t1_ch0,
+                            "t2_ch0":     t2_ch0,
+                            "dt_ch0":     dt_ch0,
+                            "a1_ch0":     a1_ch0,
+                            "fwhm1_ch0":  fwhm1_ch0,
+                            "a2_ch0":     a2_ch0,
+                            "fwhm2_ch0":  fwhm2_ch0,
+                            "t1_ch1":     t1_ch1,
+                            "t2_ch1":     np.nan,
+                            "dt_ch1":     np.nan,
+                            "a1_ch1":     a1_ch1,
+                            "fwhm1_ch1":  fwhm1_ch1,
+                            "a2_ch1":     np.nan,
+                            "fwhm2_ch1":  np.nan,
+                            "dt_inter":   np.nan,
+                            "raw_ch0":    raw_ch0 if self.save_traces_var.get() else None,
+                            "raw_ch1":    raw_ch1_data if self.save_traces_var.get() else None,
+                        })
+                    else:
+                        results.append({"type": "first_trig_count"})
                     continue
                 dt_inter = t1_ch1 - t1_ch0
 
-            self.passing_count += 1
-            self._count_times.append(item_ts)
-
-            # dt for the trigger channel
             dt_trig = dt_ch1 if trig_ch == 1 else dt_ch0
-
-            rec = {
-                "timestamp":  ts_str,
+            results.append({
+                "type":       "passing",
+                "timestamp":  item_ts,
+                "ts_str":     ts_str,
                 "t1_ch0":     t1_ch0,
                 "t2_ch0":     t2_ch0,
                 "dt_ch0":     dt_ch0,
@@ -1430,41 +1558,139 @@ class HistogramTab:
                 "a2_ch1":     a2_ch1,
                 "fwhm2_ch1":  fwhm2_ch1,
                 "dt_inter":   dt_inter,
-            }
-            if save_all:
-                rec["passes_all"] = 1
-            new_records.append(rec)
+                "raw_ch0":    raw_ch0 if self.save_traces_var.get() else None,
+                "raw_ch1":    raw_ch1_data if self.save_traces_var.get() else None,
+            })
 
-            if save_all:
-                new_all_charged.append({
-                    "timestamp":  ts_str,
-                    "passes_all": 1,
-                    "t1_trig":    t1_ch1 if trig_ch == 1 else t1_ch0,
-                    "a1_trig":    a1_ch1 if trig_ch == 1 else a1_ch0,
-                    "fwhm1_trig": fwhm1_ch1 if trig_ch == 1 else fwhm1_ch0,
-                })
+        return results
 
-            if self.save_traces_var.get():
-                trace_rows.append(raw_ch0.tolist())
-                if use_ch1 and item["ch1"] is not None:
-                    trace_rows.append(item["ch1"].tolist())
+    # Change 5: GUI drains results fast; redraws on a fixed timer
+    def _drain_results(self):
+        """GUI thread: consume results_queue, accumulate pending I/O."""
+        if not self.running:
+            return
+        try:
+            new_records     = []
+            new_all_charged = []
 
-        self.first_trigger_count_var.set(self.first_trigger_count)
+            while True:
+                try:
+                    r = self._proc_thread.results_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-        if new_records or new_all_charged:
-            if new_records:
-                self.records.extend(new_records)
-            if new_all_charged:
-                self.all_charged_records.extend(new_all_charged)
-            self.passing_var.set(self.passing_count)
-            self._update_count_rate()
-            self._save_records(new_records, new_all_charged)
+                if r["type"] == "first_trig_count":
+                    self.first_trigger_count += 1
 
-        if self.save_traces_var.get() and trace_rows and self.trace_csv_path:
-            self._append_trace_csv(trace_rows)
+                elif r["type"] == "first_trig_only":
+                    self.first_trigger_count += 1
+                    if self._run_start_time is None:
+                        self._run_start_time = r["timestamp"]
+                    ac_rec = {
+                        "timestamp":   r["ts_str"],
+                        "passes_all":  0,
+                        "t1_ch0":      r["t1_ch0"],
+                        "t2_ch0":      r["t2_ch0"],
+                        "dt_ch0":      r["dt_ch0"],
+                        "a1_ch0":      r["a1_ch0"],
+                        "fwhm1_ch0":   r["fwhm1_ch0"],
+                        "a2_ch0":      r["a2_ch0"],
+                        "fwhm2_ch0":   r["fwhm2_ch0"],
+                        "t1_ch1":      r["t1_ch1"],
+                        "t2_ch1":      r["t2_ch1"],
+                        "dt_ch1":      r["dt_ch1"],
+                        "a1_ch1":      r["a1_ch1"],
+                        "fwhm1_ch1":   r["fwhm1_ch1"],
+                        "a2_ch1":      r["a2_ch1"],
+                        "fwhm2_ch1":   r["fwhm2_ch1"],
+                        "dt_inter":    r["dt_inter"],
+                    }
+                    self.all_charged_records.append(ac_rec)
+                    new_all_charged.append(ac_rec)
+                    if r.get("raw_ch0") is not None:
+                        self._pending_traces.append(r["raw_ch0"].tolist())
+                    if r.get("raw_ch1") is not None:
+                        self._pending_traces.append(r["raw_ch1"].tolist())
 
-        if new_records:
+                elif r["type"] == "passing":
+                    self.first_trigger_count += 1
+                    if self._run_start_time is None:
+                        self._run_start_time = r["timestamp"]
+                    self._count_times.append(r["timestamp"])
+                    self.passing_count += 1
+
+                    rec = {
+                        "timestamp":   r["ts_str"],
+                        "t1_ch0":      r["t1_ch0"],
+                        "t2_ch0":      r["t2_ch0"],
+                        "dt_ch0":      r["dt_ch0"],
+                        "a1_ch0":      r["a1_ch0"],
+                        "fwhm1_ch0":   r["fwhm1_ch0"],
+                        "a2_ch0":      r["a2_ch0"],
+                        "fwhm2_ch0":   r["fwhm2_ch0"],
+                        "t1_ch1":      r["t1_ch1"],
+                        "t2_ch1":      r["t2_ch1"],
+                        "dt_ch1":      r["dt_ch1"],
+                        "a1_ch1":      r["a1_ch1"],
+                        "fwhm1_ch1":   r["fwhm1_ch1"],
+                        "a2_ch1":      r["a2_ch1"],
+                        "fwhm2_ch1":   r["fwhm2_ch1"],
+                        "dt_inter":    r["dt_inter"],
+                    }
+                    if self.save_all_charged_var.get():
+                        rec["passes_all"] = 1
+                    self.records.append(rec)
+                    new_records.append(rec)
+
+                    if self.save_all_charged_var.get():
+                        ac_rec = dict(rec)
+                        ac_rec["passes_all"] = 1
+                        self.all_charged_records.append(ac_rec)
+                        new_all_charged.append(ac_rec)
+
+                    if r.get("raw_ch0") is not None:
+                        self._pending_traces.append(r["raw_ch0"].tolist())
+                    if r.get("raw_ch1") is not None:
+                        self._pending_traces.append(r["raw_ch1"].tolist())
+
+            if new_records or new_all_charged:
+                self.first_trigger_count_var.set(self.first_trigger_count)
+                self.passing_var.set(self.passing_count)
+                self._update_count_rate()
+                self._plot_dirty = True
+
+                # Change 7: accumulate pending I/O; flush on interval/size
+                self._pending_records.extend(new_records)
+                self._pending_all_charged.extend(new_all_charged)
+                now = time.monotonic()
+                elapsed = now - self._last_flush_time
+                total_pending = len(self._pending_records) + len(self._pending_all_charged)
+                if (elapsed >= self._FLUSH_INTERVAL_S or
+                        total_pending >= self._FLUSH_N_RECORDS):
+                    self._flush_pending_io()
+                    self._last_flush_time = now
+            elif self.first_trigger_count > 0:
+                # First-trig-only counts still need updating
+                self.first_trigger_count_var.set(self.first_trigger_count)
+
+        except Exception:
+            pass
+        try:
+            self.mpl_canvas.get_tk_widget().after(100, self._drain_results)
+        except Exception:
+            pass
+
+    def _redraw_timer(self):
+        """Change 5: redraw histograms at most once per 1.5 seconds."""
+        if not self.running:
+            return
+        if self._plot_dirty and self.records:
             self._update_histograms()
+            self._plot_dirty = False
+        try:
+            self.mpl_canvas.get_tk_widget().after(1500, self._redraw_timer)
+        except Exception:
+            pass
 
     def _update_count_rate(self):
         """Compute rolling count rate over all events and update display."""
@@ -1490,58 +1716,82 @@ class HistogramTab:
         fs       = self.ads_panel.sample_rate_var.get()
         trig_ch  = self.ads_panel.trigger_ch_var.get()
         t1_ch0   = self.first_trigger_ch0_var.get()
-        t1_ch1   = self.first_trigger_ch1_var.get()
+        t2_ch0   = self.trigger_ch0_var.get()
         p_ch0    = self.pulses_ch0_var.get()
+        t1_ch1   = self.first_trigger_ch1_var.get()
+        t2_ch1   = self.trigger_ch1_var.get()
         p_ch1    = self.pulses_ch1_var.get()
         use_ch1  = self.use_ch1_var.get()
         now      = datetime.datetime.now().isoformat(timespec="seconds")
+        save_all = self.save_all_charged_var.get()
 
         lines = [
             f"# Muon Detector Run — started {now}",
             f"# Sample rate (Hz): {fs:.6g}",
             f"# Trigger channel: {trig_ch}",
             f"# Ch0 first trigger level (V): {t1_ch0}",
-            f"# Ch0 expected pulses: {p_ch0}",
         ]
+        if p_ch0 == 2:
+            lines.append(f"# Ch0 second trigger level (V): {t2_ch0}")
+        lines.append(f"# Ch0 expected pulses: {p_ch0}")
+
         if use_ch1:
-            lines += [
-                f"# Ch1 first trigger level (V): {t1_ch1}",
-                f"# Ch1 expected pulses: {p_ch1}",
-            ]
+            lines.append(f"# Ch1 first trigger level (V): {t1_ch1}")
+            if p_ch1 == 2:
+                lines.append(f"# Ch1 second trigger level (V): {t2_ch1}")
+            lines.append(f"# Ch1 expected pulses: {p_ch1}")
         else:
-            lines += ["# Ch1: disabled"]
-        lines += ["#"]
+            lines.append("# Ch1: disabled")
+
+        if save_all:
+            lines.append(
+                "# passes_all=1 → passed all triggers; "
+                "passes_all=0 → passed first trigger only"
+            )
+        lines.append("#")
         return "\n".join(lines) + "\n"
 
-    def _save_records(self, new_records, new_all_charged=None):
+    def _flush_pending_io(self):
+        """
+        Change 7: batch-write all accumulated records and traces to disk.
+        Called on a time/size threshold rather than every batch.
+        """
         if not self.time_log_path:
-            return
+            self._pending_records.clear()
+            self._pending_all_charged.clear()
+        else:
+            save_all     = self.save_all_charged_var.get()
+            rows_to_save = (self._pending_all_charged
+                            if save_all and self._pending_all_charged
+                            else self._pending_records)
+            if rows_to_save:
+                file_exists = os.path.exists(self.time_log_path)
+                try:
+                    df = pd.DataFrame(rows_to_save)
+                    if not file_exists or not self._header_written:
+                        with open(self.time_log_path, "w") as f:
+                            f.write(self._build_csv_header())
+                        df.to_csv(self.time_log_path, mode="a",
+                                  header=True, index=False)
+                        self._header_written = True
+                    else:
+                        df.to_csv(self.time_log_path, mode="a",
+                                  header=False, index=False)
+                except Exception as e:
+                    print(f"[Histogram] log write error: {e}")
+            self._pending_records.clear()
+            self._pending_all_charged.clear()
 
-        save_all = self.save_all_charged_var.get()
-        rows_to_save = (new_all_charged if save_all and new_all_charged else new_records)
-        if not rows_to_save:
-            return
-
-        file_exists = os.path.exists(self.time_log_path)
-        try:
-            df = pd.DataFrame(rows_to_save)
-            if not file_exists:
-                # Write run-settings header then column titles
-                with open(self.time_log_path, "w") as f:
-                    f.write(self._build_csv_header())
-                df.to_csv(self.time_log_path, mode="a", header=True, index=False)
-            else:
-                df.to_csv(self.time_log_path, mode="a", header=False, index=False)
-        except Exception as e:
-            print(f"[Histogram] log write error: {e}")
-
-    def _append_trace_csv(self, rows):
-        try:
-            write_header = not os.path.exists(self.trace_csv_path)
-            pd.DataFrame(rows).to_csv(
-                self.trace_csv_path, mode="a", header=write_header, index=False)
-        except Exception as e:
-            print(f"[Histogram] trace CSV write error: {e}")
+        # Flush pending traces
+        if self._pending_traces and self.save_traces_var.get() and self.trace_csv_path:
+            try:
+                write_header = not os.path.exists(self.trace_csv_path)
+                pd.DataFrame(self._pending_traces).to_csv(
+                    self.trace_csv_path, mode="a",
+                    header=write_header, index=False)
+            except Exception as e:
+                print(f"[Histogram] trace CSV write error: {e}")
+        self._pending_traces.clear()
 
     def _update_histograms(self):
         if not self.records:
@@ -1649,6 +1899,11 @@ class App:
     def _on_close(self):
         self.viewer.running    = False
         self.histogram.running = False
+        # Stop background processing threads before disconnecting
+        self.viewer._proc_thread.stop()
+        self.histogram._proc_thread.stop()
+        # Flush any data still pending in the histogram's I/O buffer
+        self.histogram._flush_pending_io()
         self.viewer.acq.disconnect()
         self.histogram.acq.disconnect()
         self.root.quit()

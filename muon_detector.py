@@ -7,8 +7,8 @@ Processing logic
 ----------------
 * analog_in_capture_multiple is used when Ch1 is enabled (shared buffer zero).
 * analog_in_capture is used for Ch0-only mode.
-* Expected pulses = 1  → must cross first_trig anywhere in full trace.
-* Expected pulses = 2  → must also cross second_trig inside [start_us, stop_us].
+* Expected pulses = 1  : must cross first_trig anywhere in full trace.
+* Expected pulses = 2  : must also cross second_trig inside [start_us, stop_us].
 * "Events read"    = events passing the trigger channel first trigger.
 * "Passing triggers" = events passing ALL configured trigger criteria.
 
@@ -31,8 +31,6 @@ Histogram layout (ch1 enabled, trigger ch=ch0, both ch have 2 pulses):
   Row 1: Ch0 P1 height | Ch0 P1 FWHM | Ch0 P2 height | Ch0 P2 FWHM
   Row 2: Ch1 P1 height | Ch1 P1 FWHM | Ch1 P2 height | Ch1 P2 FWHM
   Row 3 (full width): dt_inter = t1_ch1 - t1_ch0
-
-Performance suggestions (see bottom of file).
 """
 
 import tkinter as tk
@@ -489,7 +487,7 @@ def analyse_channel(raw, fs, first_trig, second_trig, expected_pulses,
       1. Find trigger crossing on raw trace.
       2. Subtract pretrigger baseline (offset correction).
       3. Apply filter (sosfiltfilt for numerical stability).
-      4. Extract amplitude/width from filtered trace.
+      4. Extract amplitude/width (fwhm) from filtered trace.
 
     cross_idx  : buffer-absolute index of first trigger crossing (or None)
     t1_us      : cross_idx / fs * 1e6
@@ -505,24 +503,24 @@ def analyse_channel(raw, fs, first_trig, second_trig, expected_pulses,
                   np.nan, np.nan, np.nan, np.nan,
                   raw.copy(), raw.copy())
 
-    # Step 1: find trigger crossing on raw
+    # find trigger crossing on raw
     cross = find_first_trigger_index(raw, first_trig)
     if cross is None:
         return nan_result
 
     t1_us = cross / fs * 1e6
 
-    # Step 2: offset correction
+    # offset correction
     offset_corrected = subtract_pretrigger_offset(raw, cross, fs)
 
-    # Step 3: apply filter to full offset-corrected trace (sosfiltfilt is
+    # apply filter to full offset-corrected trace (sosfiltfilt is
     # numerically more stable and faster than direct-form filtfilt)
     if do_filter and sos is not None and len(offset_corrected) > 9:
         filtered = sig.sosfiltfilt(sos, offset_corrected)
     else:
         filtered = offset_corrected.copy()
 
-    # Step 4: extract pulse metrics from filtered trace
+    # extract pulse metrics from filtered trace
     chopped_filt = filtered[cross:]
 
     win1   = chopped_filt[:start_idx]
@@ -562,7 +560,7 @@ def analyse_channel(raw, fs, first_trig, second_trig, expected_pulses,
 
 
 # ===========================================================================
-# Processing thread  (change 1 & 6: background processing, unbounded drain)
+# Processing thread
 # ===========================================================================
 
 class ProcessingThread:
@@ -571,9 +569,9 @@ class ProcessingThread:
     background thread, and pushes finished result dicts into results_queue.
     The GUI only reads results_queue for plotting / histogramming.
 
-    Change 2: filter coefficients (sos) are pre-computed once and only
+    Filter coefficients (sos) are pre-computed once and only
     recomputed when fs or fc change (dirty flag).
-    Change 6: the queue is drained completely on every processing cycle —
+    The queue is drained completely on every processing cycle —
     no 50-item cap.
     """
 
@@ -632,7 +630,7 @@ class ProcessingThread:
 
     def _loop(self):
         while not self._stop_event.is_set():
-            # Change 6: drain the entire queue in one shot — no item cap
+            # drain the entire queue in one shot — no item cap
             batch = []
             while True:
                 try:
@@ -729,14 +727,14 @@ class SignalViewerTab:
         self.acq     = acq
         self.running = True
 
-        # Change 8: only keep the last N traces (N = max_display_var).
+        # only keep the last N traces (N = max_display_var).
         # We use a collections.deque with maxlen; it is updated whenever
         # max_display_var changes.
         import collections
         self._collections = collections
 
         # stored as (raw_trim, offset_trim, filt_trim, cross_in_trim) tuples
-        # Change 8: deques with bounded length — no unbounded list growth
+        # deques with bounded length — no unbounded list growth
         self.stored_ch0 = collections.deque()
         self.stored_ch1 = collections.deque()
         self.first_trigger_count = 0
@@ -764,23 +762,22 @@ class SignalViewerTab:
         self.holdoff_us_var  = tk.DoubleVar(value=0.5)
         self.max_display_var = tk.IntVar(value=50)
 
-        # Change 8: trace of raw waveforms to CSV removed; no save_traces_var
         self.first_trigger_count_var = tk.IntVar(value=0)
         self.passing_var             = tk.IntVar(value=0)
 
-        # Change 5: decoupled redraw timer (1 s)
+        # decoupled redraw timer (1 s)
         self._plot_dirty   = False
         self._last_start_idx = 0
 
         self._build(parent)
 
-        # Change 1: start ProcessingThread
+        # start ProcessingThread
         self._proc_thread = ProcessingThread(self.acq, self._processing_fn)
         self._proc_thread.get_fs = lambda: self.ads_panel.sample_rate_var.get()
         self._proc_thread.get_fc = lambda: self.filter_var.get()
         self._proc_thread.start()
 
-        # Change 5: fast results-drain (100 ms), slow redraw (1000 ms)
+        # fast results-drain (100 ms), slow redraw (1000 ms)
         parent.after(100,  self._drain_results)
         parent.after(1000, self._redraw_timer)
 
@@ -819,9 +816,8 @@ class SignalViewerTab:
         add_row(frame, "Window stop after trig (µs)",  self.stop_us_var)
         add_row(frame, "Holdoff (µs)",                 self.holdoff_us_var)
         add_row(frame, "Max traces to display",        self.max_display_var)
-        # Change 8: resize deques when the user changes max_display
+        # resize deques when the user changes max_display
         self.max_display_var.trace_add("write", self._on_max_display_change)
-        # Change 8: raw-trace CSV saving removed from Signal Viewer
 
         self.ads_panel = AdsPanel(
             frame, self.acq, self.use_ch1_var,
@@ -890,7 +886,7 @@ class SignalViewerTab:
         self._rebuild_axes()
 
     # ------------------------------------------------------------------ #
-    # Change 1: processing_fn runs inside ProcessingThread (background)   #
+    # processing_fn runs inside ProcessingThread (background)   #
     # ------------------------------------------------------------------ #
 
     def _processing_fn(self, batch, sos, do_filter, fs):
@@ -974,7 +970,7 @@ class SignalViewerTab:
 
         return results
 
-    # Change 5: GUI drains results fast but only redraws on a fixed timer
+    # GUI drains results fast but only redraws on a fixed timer
     def _drain_results(self):
         """GUI thread: drain results_queue, accumulate, mark dirty."""
         if not self.running:
@@ -1035,7 +1031,7 @@ class SignalViewerTab:
                           color_raw, color_off, color_filt, title):
             ax.clear()
             _style_ax(ax, title=title, ylabel="Amplitude (V)")
-            # Change 8: stored is already a deque(maxlen=max_display)
+            # stored is already a deque(maxlen=max_display)
             for idx, (raw_tr, off_tr, filt_tr, cross_in) in enumerate(stored):
                 t_us  = (np.arange(len(raw_tr)) - cross_in) / fs * 1e6
                 alpha = 0.3
@@ -1096,7 +1092,7 @@ class HistogramTab:
         self._run_start_time     = None    # datetime when acquisition started
         self._count_times        = []      # list of datetime for each passing event
 
-        # Change 7: accumulate rows in memory; flush to disk every N records
+        # accumulate rows in memory; flush to disk every N records
         # or every T seconds rather than on every batch.
         self._pending_records     = []     # unflushed fully-passing rows
         self._pending_all_charged = []     # unflushed all-charged rows
@@ -1106,7 +1102,7 @@ class HistogramTab:
         self._FLUSH_N_RECORDS     = 200    # … or every 200 records
         self._header_written      = False
 
-        # Change 5: decouple processing from plotting
+        # decouple processing from plotting
         self._plot_dirty = False
 
         # ---- Tk vars ----
@@ -1143,13 +1139,13 @@ class HistogramTab:
 
         self._build(parent)
 
-        # Change 1: start ProcessingThread
+        # start ProcessingThread
         self._proc_thread = ProcessingThread(self.acq, self._processing_fn)
         self._proc_thread.get_fs = lambda: self.ads_panel.sample_rate_var.get()
         self._proc_thread.get_fc = lambda: self.filter_var.get()
         self._proc_thread.start()
 
-        # Change 5: fast results-drain (100 ms), slow redraw (1500 ms)
+        # Fast results-drain (100 ms), slow redraw (1500 ms)
         parent.after(100,  self._drain_results)
         parent.after(1500, self._redraw_timer)
 
@@ -1401,7 +1397,7 @@ class HistogramTab:
         self.first_trigger_count_var.set(0)
         self.passing_var.set(0)
         self.count_rate_var.set("Rate: — Hz")
-        # Change 7: discard any pending (unwritten) data
+        # discard any pending (unwritten) data
         self._pending_records.clear()
         self._pending_all_charged.clear()
         self._pending_traces.clear()
@@ -1424,7 +1420,7 @@ class HistogramTab:
             pd.DataFrame(src).to_csv(path, index=False)
 
     # ------------------------------------------------------------------
-    # Change 1: processing_fn runs inside ProcessingThread (background)
+    # Processing_fn runs inside ProcessingThread (background)
     # ------------------------------------------------------------------
 
     def _processing_fn(self, batch, sos, do_filter, fs):
@@ -1564,7 +1560,7 @@ class HistogramTab:
 
         return results
 
-    # Change 5: GUI drains results fast; redraws on a fixed timer
+    # GUI drains results fast; redraws on a fixed timer
     def _drain_results(self):
         """GUI thread: consume results_queue, accumulate pending I/O."""
         if not self.running:
@@ -1659,7 +1655,7 @@ class HistogramTab:
                 self._update_count_rate()
                 self._plot_dirty = True
 
-                # Change 7: accumulate pending I/O; flush on interval/size
+                # Accumulate pending I/O; flush on interval/size
                 self._pending_records.extend(new_records)
                 self._pending_all_charged.extend(new_all_charged)
                 now = time.monotonic()
@@ -1681,7 +1677,7 @@ class HistogramTab:
             pass
 
     def _redraw_timer(self):
-        """Change 5: redraw histograms at most once per 1.5 seconds."""
+        """Redraw histograms at most once per 1.5 seconds."""
         if not self.running:
             return
         if self._plot_dirty and self.records:
@@ -1753,7 +1749,7 @@ class HistogramTab:
 
     def _flush_pending_io(self):
         """
-        Change 7: batch-write all accumulated records and traces to disk.
+        Batch-write all accumulated records and traces to disk.
         Called on a time/size threshold rather than every batch.
         """
         if not self.time_log_path:
